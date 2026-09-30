@@ -2397,14 +2397,30 @@ function base64ByteLength(base64) {
   if (base64[len - 2] === "=") padding++;
   return Math.floor(len * 3 / 4) - padding;
 }
+// 逐字节拼字符串对视频是灾难：8MB 要在主线程同步卡 0.5 秒（手机上几秒），聊天里每个视频上屏都要来一遍。
+// 分块 fromCharCode.apply 结果逐字节相同、快一个数量级；块大小留在参数个数上限以内。
 function arrayBufferToBase64(buffer) {
-  let binary = "";
   const bytes = new Uint8Array(buffer);
-  const len = bytes.byteLength;
-  for (let i = 0; i < len; i++) {
-    binary += String.fromCharCode(bytes[i]);
+  const CHUNK = 32768;
+  const parts = [];
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    parts.push(String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK)));
   }
-  return window.btoa(binary);
+  return window.btoa(parts.join(""));
+}
+// 读库出来的媒体转 data URL：交给浏览器原生 FileReader 编码，不占主线程；
+// 失败才退回同步分块。前缀照旧自己拼，和原来 `data:${mime};base64,` 的格式完全一致。
+async function arrayBufferToDataUrlAsync(buffer, mimeType) {
+  try {
+    const dataUrl = await blobToBase64(new Blob([buffer]));
+    const commaIdx = typeof dataUrl === "string" ? dataUrl.indexOf(",") : -1;
+    if (commaIdx !== -1) {
+      return `data:${mimeType};base64,` + dataUrl.slice(commaIdx + 1);
+    }
+  } catch (e) {
+    console.warn("[DB] FileReader 转码失败，改用同步转码:", e);
+  }
+  return `data:${mimeType};base64,` + arrayBufferToBase64(buffer);
 }
 function blobToBase64(blob) {
   return new Promise((resolve, reject) => {
@@ -3028,7 +3044,7 @@ async function getItemImg(tag, index = null) {
           mimeType = storedFormat;
         }
       }
-      const mediaBase64 = `data:${mimeType};base64,` + arrayBufferToBase64(imageData.data);
+      const mediaBase64 = await arrayBufferToDataUrlAsync(imageData.data, mimeType);
       return [mediaBase64, change, finalIndex, isVideo, originalUrl];
     }
   }
@@ -7784,7 +7800,8 @@ async function fixMp4Faststart(blob) {
         size = bytes.length - pos;
       }
       if (size < 8) break;
-      boxes.push({ type, size, data: bytes.slice(pos, pos + size) });
+      // 只取视图不复制：绝大多数视频本来就是 faststart，原来每次都白白把整个文件拷一遍。
+      boxes.push({ type, size, data: bytes.subarray(pos, pos + size) });
       pos += size;
     }
     const moovIdx = boxes.findIndex((b) => b.type === "moov");
@@ -35795,6 +35812,122 @@ function resolveMediaContainer(doc, anchorSpan, requestId, insertMode) {
   anchorSpan.style.display = "none";
   return container;
 }
+// 聊天里的视频以前一律 autoplay+loop：视频一多就是几十路解码同时跑，滚出屏幕的也照跑，整页卡顿。
+// 现在只播放看得见的：进入视口才 play，离开视口就暂停。两种情况不动它：
+// 用户自己按过暂停的（回到视口也不续播），以及用户开了声音的（用户在听，滚走也继续放）。
+function getChatVideoObserver(doc) {
+  if (chatVideoObservers.has(doc)) return chatVideoObservers.get(doc);
+  const IO = doc?.defaultView?.IntersectionObserver || (typeof IntersectionObserver === "function" ? IntersectionObserver : null);
+  let observer = null;
+  if (IO) {
+    try {
+      observer = new IO((entries) => {
+        for (const entry of entries) {
+          const video = entry.target;
+          video._chatu8Visible = entry.isIntersecting;
+          if (entry.isIntersecting) {
+            playChatVideoIfAllowed(video);
+          } else {
+            pauseChatVideoOffscreen(video);
+          }
+        }
+      });
+    } catch (e) {
+      observer = null;
+    }
+  }
+  chatVideoObservers.set(doc, observer);
+  return observer;
+}
+function playChatVideoIfAllowed(video) {
+  if (!video?.isConnected || !video.paused) return;
+  if (video._chatu8Visible === false || video.dataset.userPaused === "true") return;
+  // src 还在异步转换时先不播，赋值那一刻会再调一次。
+  if (!video.getAttribute("src")) return;
+  const p = video.play();
+  if (p && typeof p.catch === "function") p.catch(() => {
+  });
+}
+function pauseChatVideoOffscreen(video) {
+  if (video.paused || !video.muted) return;
+  video._chatu8AutoPausing = true;
+  video.pause();
+}
+function setupChatVideoPlayback(video) {
+  video.addEventListener("pause", () => {
+    // 摘掉的旧元素会补发 pause，不能当成用户操作。
+    if (!video.isConnected) return;
+    if (video._chatu8AutoPausing) {
+      video._chatu8AutoPausing = false;
+      return;
+    }
+    video.dataset.userPaused = "true";
+  });
+  video.addEventListener("play", () => {
+    delete video.dataset.userPaused;
+  });
+  const observer = getChatVideoObserver(video.ownerDocument);
+  if (observer) {
+    observer.observe(video);
+  } else {
+    video.autoplay = true;
+  }
+}
+// 楼层重绘（swipe、编辑、切聊天、同层卡 iframe 重建）会把旧视频元素整个丢掉，
+// 但它的 blob URL 以前从不释放，整段视频一直占着内存，聊天越长越卡。
+// 这里登记每个聊天视频的 blob URL，元素脱离文档持续一段时间后才释放：DOM 搬动时会短暂脱离，不能一脱离就收。
+function trackChatVideoBlobUrl(video, blobUrl) {
+  const prev = chatVideoBlobUrls.get(video);
+  if (prev && prev.url !== blobUrl) {
+    try {
+      URL.revokeObjectURL(prev.url);
+    } catch (e) {
+    }
+  }
+  chatVideoBlobUrls.set(video, { url: blobUrl, detachedAt: 0 });
+  if (!chatVideoSweepTimer) {
+    chatVideoSweepTimer = setInterval(sweepDetachedChatVideos, CHAT_VIDEO_SWEEP_INTERVAL_MS);
+  }
+}
+function isChatVideoAttached(video) {
+  // iframe 被移除后，里面的元素仍然「连在」那个已废弃的文档上，isConnected 还是 true，要再看 defaultView。
+  return video.isConnected && Boolean(video.ownerDocument?.defaultView);
+}
+function sweepDetachedChatVideos(now = Date.now()) {
+  let released = 0;
+  for (const [video, entry] of chatVideoBlobUrls) {
+    if (isChatVideoAttached(video)) {
+      entry.detachedAt = 0;
+      continue;
+    }
+    if (!entry.detachedAt) {
+      entry.detachedAt = now;
+      continue;
+    }
+    if (now - entry.detachedAt < CHAT_VIDEO_BLOB_RELEASE_MS) continue;
+    chatVideoBlobUrls.delete(video);
+    try {
+      chatVideoObservers.get(video.ownerDocument)?.unobserve(video);
+    } catch (e) {
+    }
+    try {
+      // 先卸掉播放器的数据源，解码器和缓冲立即释放，不用等元素被垃圾回收。
+      video.removeAttribute("src");
+      video.load();
+    } catch (e) {
+    }
+    try {
+      URL.revokeObjectURL(entry.url);
+    } catch (e) {
+    }
+    released++;
+  }
+  if (chatVideoBlobUrls.size === 0 && chatVideoSweepTimer) {
+    clearInterval(chatVideoSweepTimer);
+    chatVideoSweepTimer = null;
+  }
+  return released;
+}
 function createAndShowImage(container, imageUrl, alt, button, change, isVideo = false, originalUrl = "") {
   const doc = container.ownerDocument;
   if (!doc) return;
@@ -35808,15 +35941,23 @@ function createAndShowImage(container, imageUrl, alt, button, change, isVideo = 
     media.muted = true;
     media.playsInline = true;
     media.dataset.isVideo = "true";
-    media.autoplay = true;
+    // 不再 autoplay：播不播交给可见性观察器（见 setupChatVideoPlayback），屏幕外的视频不占解码器。
+    media.preload = "metadata";
+    setupChatVideoPlayback(media);
     if (imageUrl.startsWith("data:")) {
-      _dataUrlToBlob(imageUrl).then((rawBlob) => fixMp4Faststart(rawBlob)).then((blob) => {
+      // 这里的闭包只能引用块内的 dataUrl，不能引用参数 imageUrl：参数一旦被闭包捕获，
+      // 下面那些点击/长按监听器活多久，十几 MB 的 base64 字符串就会被留多久。
+      const dataUrl = imageUrl;
+      _dataUrlToBlob(dataUrl).then((rawBlob) => fixMp4Faststart(rawBlob)).then((blob) => {
         const blobUrl = URL.createObjectURL(blob);
         media.dataset.blobUrl = blobUrl;
+        trackChatVideoBlobUrl(media, blobUrl);
         media.src = blobUrl;
+        playChatVideoIfAllowed(media);
       }).catch((e) => {
         console.warn("[video] Blob URL \u521B\u5EFA\u5931\u8D25\uFF0C\u56DE\u9000\u4F7F\u7528 data URL:", e);
-        media.src = imageUrl;
+        media.src = dataUrl;
+        playChatVideoIfAllowed(media);
       });
     } else {
       media.src = imageUrl;
@@ -35827,6 +35968,7 @@ function createAndShowImage(container, imageUrl, alt, button, change, isVideo = 
       if (originalUrl && this.src !== originalUrl) {
         console.log("[iframe] \u5C1D\u8BD5\u4F7F\u7528\u539F\u59CB URL \u5099\u7528\u64AD\u653E:", originalUrl);
         this.src = originalUrl;
+        playChatVideoIfAllowed(this);
         return;
       }
       const notice = doc.createElement("div");
@@ -35847,7 +35989,7 @@ function createAndShowImage(container, imageUrl, alt, button, change, isVideo = 
       text.textContent = "\u26A0\uFE0F \u89C6\u9891\u5728\u5F53\u524D\u6D4F\u89C8\u5668\u73AF\u5883\u4E2D\u65E0\u6CD5\u64AD\u653E\uFF0C\u8BF7\u4E0B\u8F7D\u540E\u7528\u89C6\u9891\u64AD\u653E\u5668\u89C2\u770B";
       text.style.opacity = "0.9";
       const downloadBtn = doc.createElement("a");
-      const blobSrc = media.dataset.blobUrl || imageUrl;
+      const blobSrc = media.dataset.blobUrl || media.getAttribute("src") || "";
       downloadBtn.href = blobSrc;
       downloadBtn.download = "video.mp4";
       downloadBtn.textContent = "\u{1F4E5} \u4E0B\u8F7D\u89C6\u9891";
@@ -36005,6 +36147,12 @@ var LOADING_STALE_TIMEOUT_MS = 20 * 60 * 1e3;
 var hydrateState = { running: false };
 var resultWatchdogs = /* @__PURE__ */ new Map();
 var RESULT_WATCHDOG_INTERVAL_MS = 30 * 1e3;
+// 聊天视频：每个文档一个可见性观察器（同层卡 iframe 各有各的），以及待回收的 blob URL 登记表。
+var chatVideoObservers = /* @__PURE__ */ new WeakMap();
+var chatVideoBlobUrls = /* @__PURE__ */ new Map();
+var chatVideoSweepTimer = null;
+var CHAT_VIDEO_SWEEP_INTERVAL_MS = 10 * 1e3;
+var CHAT_VIDEO_BLOB_RELEASE_MS = 30 * 1e3;
 // 补渲染兜底不能误伤刚发起的生成：只有转圈超过这个时长的按钮才允许被兜底复位。
 var HYDRATE_MIN_LOADING_AGE_MS = 20 * 1e3;
 var init_generation = __esm({
@@ -37130,34 +37278,27 @@ var init_chatProcessor = __esm({
 
 // utils/iframe/imagePreview.js
 async function applyVideoSrc(videoEl, dataUrl, originalUrl = "") {
-  if (videoEl.src && videoEl.src.startsWith("blob:")) {
-    URL.revokeObjectURL(videoEl.src);
-  }
+  // 旧 blob 等新地址换上再释放：先释放的话，转换那段时间里正在播的视频会读到失效地址报错。
+  const oldBlobUrl = videoEl.src && videoEl.src.startsWith("blob:") ? videoEl.src : "";
+  const revokeOld = () => {
+    if (oldBlobUrl && oldBlobUrl !== videoEl.src) URL.revokeObjectURL(oldBlobUrl);
+  };
   try {
-    const commaIdx = dataUrl.indexOf(",");
-    const mimeType = dataUrl.slice(5, dataUrl.indexOf(";"));
-    const base64 = dataUrl.slice(commaIdx + 1);
-    const CHUNK = 512 * 1024;
-    const parts = [];
-    for (let i = 0; i < base64.length; i += CHUNK) {
-      const chunk = base64.slice(i, i + CHUNK);
-      const binaryStr = atob(chunk);
-      const bytes = new Uint8Array(binaryStr.length);
-      for (let j = 0; j < binaryStr.length; j++) bytes[j] = binaryStr.charCodeAt(j);
-      parts.push(bytes);
-      if (parts.length % 5 === 0) await new Promise((r) => setTimeout(r, 0));
-    }
-    const rawBlob = new Blob(parts, { type: mimeType });
+    const rawBlob = await _dataUrlToBlob(dataUrl);
     const blob = await fixMp4Faststart(rawBlob);
     const blobUrl = URL.createObjectURL(blob);
     videoEl.dataset.blobUrl = blobUrl;
     videoEl.src = blobUrl;
+    trackChatVideoBlobUrl(videoEl, blobUrl);
+    revokeOld();
+    playChatVideoIfAllowed(videoEl);
     if (originalUrl) {
       const onErr = function() {
         videoEl.removeEventListener("error", onErr);
         if (originalUrl && videoEl.src !== originalUrl) {
           console.log("[imagePreview] BlobURL \u5931\u8D25\uFF0C\u56DE\u9000\u5230\u539F\u59CB URL:", originalUrl);
           videoEl.src = originalUrl;
+          playChatVideoIfAllowed(videoEl);
         }
       };
       videoEl.addEventListener("error", onErr);
@@ -37165,6 +37306,8 @@ async function applyVideoSrc(videoEl, dataUrl, originalUrl = "") {
   } catch (e) {
     console.warn("[imagePreview] applyVideoSrc \u5931\u8D25\uFF0C\u56DE\u9000:", e);
     videoEl.src = originalUrl || dataUrl;
+    revokeOld();
+    playChatVideoIfAllowed(videoEl);
   }
 }
 async function downloadBlob(blob, filename) {
