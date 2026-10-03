@@ -2479,6 +2479,8 @@ var init_config = __esm({
       sdUrl: "http://localhost:7860",
       st_chatu8_sd_auth: "",
       comfyuiUrl: "http://localhost:8188",
+      comfyui_max_concurrency: 10,
+      comfyui_timeout: 1800,
       // RunningHub 配置
       runninghub_apiKey: "",
       runninghub_workflowId: "",
@@ -9133,6 +9135,15 @@ function cancelSerialLock(taskId) {
 function resetSerialLock() {
   serialLock.reset();
 }
+function acquireComfyUILock(taskId, signal = null) {
+  return comfyuiConcurrencyLock.acquire(taskId, signal);
+}
+function releaseComfyUILock(taskId) {
+  comfyuiConcurrencyLock.release(taskId);
+}
+function cancelComfyUILock(taskId) {
+  comfyuiConcurrencyLock.remove(taskId);
+}
 function addSmoothShakeEffect(imgElement) {
   if (getComputedStyle(imgElement).position === "static") {
     imgElement.style.position = "relative";
@@ -10188,7 +10199,7 @@ function normalizePromptTag(tag) {
   const substituted = safeSubstituteParams(tag);
   return substituted.trim().replaceAll("\r", "").replaceAll("\n", "").replaceAll("\u300A", "<").replaceAll("\u300B", ">").replace(/，/g, ",").replace(/；/g, ";").replace(/：/g, ":");
 }
-var REFERENCE_PIXEL_COUNT, SIGMA_MAGIC_NUMBER, SIGMA_MAGIC_NUMBER_V4_5, LOG_RETENTION_MS, MAX_PERSISTED_LOG_SESSIONS, MAX_LOG_STORE_CHARS, LOG_ROLLING_TRIM_TARGET, logPersistenceStatePromise, logWriteQueue, _logInitialized, _pendingLogBuffer, _persistDebounceTimer, LOG_PERSIST_DEBOUNCE_MS, LOG_PERSIST_MAX_WAIT_MS, _persistFirstRequestTime, _expiredLogCleanupRunning, _expiredLogCleanupBudgetRemaining, SerialLockManager, serialLock, _logDomUpdateTimer, _logDomLastUpdate, MAX_MACRO_CACHE_ENTRIES, macroSubstitutionCache;
+var REFERENCE_PIXEL_COUNT, SIGMA_MAGIC_NUMBER, SIGMA_MAGIC_NUMBER_V4_5, LOG_RETENTION_MS, MAX_PERSISTED_LOG_SESSIONS, MAX_LOG_STORE_CHARS, LOG_ROLLING_TRIM_TARGET, logPersistenceStatePromise, logWriteQueue, _logInitialized, _pendingLogBuffer, _persistDebounceTimer, LOG_PERSIST_DEBOUNCE_MS, LOG_PERSIST_MAX_WAIT_MS, _persistFirstRequestTime, _expiredLogCleanupRunning, _expiredLogCleanupBudgetRemaining, SerialLockManager, serialLock, ComfyUIConcurrencyManager, comfyuiConcurrencyLock, _logDomUpdateTimer, _logDomLastUpdate, MAX_MACRO_CACHE_ENTRIES, macroSubstitutionCache;
 var init_utils = __esm({
   "utils/utils.js"() {
     init_config();
@@ -10326,6 +10337,108 @@ var init_utils = __esm({
       }
     };
     serialLock = new SerialLockManager();
+    ComfyUIConcurrencyManager = class {
+      constructor(maxConcurrency = 10) {
+        this.maxConcurrency = maxConcurrency;
+        this.runningTasks = /* @__PURE__ */ new Set();
+        this.queue = [];
+      }
+      setMaxConcurrency(limit) {
+        const num = parseInt(limit, 10);
+        if (Number.isFinite(num) && num >= 1 && num <= 10) {
+          this.maxConcurrency = num;
+          this._dispatchNext();
+        }
+      }
+      getMaxConcurrency() {
+        return this.maxConcurrency;
+      }
+      acquire(taskId, signal = null) {
+        return new Promise((resolve, reject) => {
+          if (signal?.aborted) {
+            const err = signal.reason instanceof Error ? signal.reason : signal.reason ? new Error(String(signal.reason)) : new Error("\u4EFB\u52A1\u5DF2\u53D6\u6D88");
+            reject(err);
+            return;
+          }
+          const queueItem = {
+            taskId,
+            resolve,
+            reject,
+            signal,
+            isAborted: false
+          };
+          if (signal) {
+            const abortHandler = () => {
+              queueItem.isAborted = true;
+              this.remove(taskId);
+              const reasonErr = signal.reason instanceof Error ? signal.reason : signal.reason ? new Error(String(signal.reason)) : new Error("\u4EFB\u52A1\u5DF2\u53D6\u6D88");
+              reject(reasonErr);
+            };
+            signal.addEventListener("abort", abortHandler, { once: true });
+          }
+          if (this.runningTasks.size < this.maxConcurrency && this.queue.length === 0) {
+            this.runningTasks.add(taskId);
+            this._syncGlobalXiancheng();
+            resolve();
+            return;
+          }
+          this.queue.push(queueItem);
+          this._syncGlobalXiancheng();
+        });
+      }
+      release(taskId) {
+        this.runningTasks.delete(taskId);
+        this._dispatchNext();
+        this._syncGlobalXiancheng();
+      }
+      remove(taskId) {
+        const index = this.queue.findIndex((item) => item.taskId === taskId);
+        if (index !== -1) {
+          this.queue.splice(index, 1);
+        }
+        if (this.runningTasks.has(taskId)) {
+          this.release(taskId);
+        } else {
+          this._syncGlobalXiancheng();
+        }
+      }
+      reset() {
+        while (this.queue.length > 0) {
+          const item = this.queue.shift();
+          try {
+            item.reject(new Error("ComfyUI \u4EFB\u52A1\u961F\u5217\u5DF2\u91CD\u7F6E"));
+          } catch (_) {
+          }
+        }
+        this.runningTasks.clear();
+        this._syncGlobalXiancheng();
+      }
+      _dispatchNext() {
+        while (this.runningTasks.size < this.maxConcurrency && this.queue.length > 0) {
+          const nextItem = this.queue.shift();
+          if (nextItem.isAborted || nextItem.signal && nextItem.signal.aborted) {
+            continue;
+          }
+          this.runningTasks.add(nextItem.taskId);
+          nextItem.resolve();
+          return;
+        }
+      }
+      _syncGlobalXiancheng() {
+        const hasAvailableSlot = this.runningTasks.size < this.maxConcurrency;
+        window.xiancheng = hasAvailableSlot;
+        if (hasAvailableSlot) {
+          window.dispatchEvent(new Event("xianchengReleased"));
+        }
+      }
+      getActiveCount() {
+        return this.runningTasks.size;
+      }
+      getQueueLength() {
+        return this.queue.length;
+      }
+    };
+    comfyuiConcurrencyLock = new ComfyUIConcurrencyManager(10);
     _logDomUpdateTimer = null;
     _logDomLastUpdate = 0;
     MAX_MACRO_CACHE_ENTRIES = 200;
@@ -14667,8 +14780,7 @@ var init_taskQueue = __esm({
       AUTO_CLICK: "auto_click",
       SD: "sd",
       LLM: "llm",
-      BANANA: "banana",
-      PREGEN: "pregen"
+      BANANA: "banana"
     };
     TaskQueue = class {
       constructor() {
@@ -14686,25 +14798,23 @@ var init_taskQueue = __esm({
       /**
        * 添加任务到队列
        * @param {object} task 任务信息
-       * @param {string} [task.id] 可选自定义任务ID
        * @param {string} task.name 任务名称
-       * @param {string} task.type 任务类型
+       * @param {string} task.type 任务类型 (button | comfyui)
        * @param {string} [task.prompt] 完整 prompt
        * @param {HTMLElement} [task.buttonElement] 按钮元素引用
-       * @param {string} [task.status] 初始状态
        * @returns {string} 任务ID
        */
       addTask(task) {
-        const id = task.id || this.generateId();
+        const id = this.generateId();
         const newTask = {
           id,
           name: task.name || "\u672A\u547D\u540D\u4EFB\u52A1",
           type: task.type || TaskType.BUTTON,
           prompt: task.prompt || "",
           buttonElement: task.buttonElement || null,
-          status: task.status || TaskStatus.QUEUED,
+          status: TaskStatus.QUEUED,
           createdAt: Date.now(),
-          startedAt: task.status === TaskStatus.RUNNING ? Date.now() : null,
+          startedAt: null,
           completedAt: null
         };
         this.tasks.set(id, newTask);
@@ -47020,9 +47130,18 @@ async function generateComfyUIImage({ prompt: link, width: Xwidth, height: Xheig
     type: taskType,
     prompt: link
   });
-  currentTaskId2 = taskId;
+  const abortController = new AbortController();
+  const configuredUrl = (extension_settings49[extensionName]?.comfyuiUrl || "http://localhost:8188").trim();
+  activeComfyuiTasks.set(taskId, {
+    abortController,
+    url: configuredUrl,
+    promptId: null,
+    startTime: Date.now()
+  });
+  const maxConcurrency = Math.max(1, Math.min(10, parseInt(extension_settings49[extensionName]?.comfyui_max_concurrency, 10) || 10));
+  comfyuiConcurrencyLock.setMaxConcurrency(maxConcurrency);
   let lockAcquired = false;
-  await acquireSerialLock(taskId);
+  await acquireComfyUILock(taskId, abortController.signal);
   lockAcquired = true;
   taskQueue.updateStatus(taskId, TaskStatus.RUNNING);
   const startTime = Date.now();
@@ -47070,7 +47189,7 @@ async function generateComfyUIImage({ prompt: link, width: Xwidth, height: Xheig
     addLog("\u8BF7\u586B\u5199ComfyUI\u6A21\u578B\u3002");
     toastr.error("\u8BF7\u586B\u5199ComfyUI\u6A21\u578B\u3002");
     taskQueue.completeTask(taskId, false);
-    currentTaskId2 = null;
+    activeComfyuiTasks.delete(taskId);
     return;
   }
   const url = extension_settings49[extensionName].comfyuiUrl.trim();
@@ -47111,7 +47230,7 @@ async function generateComfyUIImage({ prompt: link, width: Xwidth, height: Xheig
   if (!extension_settings49[extensionName].yushe || !extension_settings49[extensionName].yushe[_comfyui_yushe_id]) {
     toastr.error("\u672A\u80FD\u627E\u5230\u6240\u9009\u7684\u56FA\u5B9A\u63D0\u793A\u8BCD\u9884\u8BBE\u3002\u8BF7\u524D\u5F80\u63D2\u4EF6\u8BBE\u7F6E\u4E2D\u65B0\u5EFA\u6216\u9009\u62E9\u4E00\u4E2A\u56FA\u5B9A\u63D0\u793A\u8BCD\u3002", "ComfyUI \u751F\u56FE\u9519\u8BEF");
     taskQueue.completeTask(taskId, false);
-    currentTaskId2 = null;
+    activeComfyuiTasks.delete(taskId);
     throw new Error("\u56FA\u5B9A\u63D0\u793A\u8BCD\u9884\u8BBE\u672A\u914D\u7F6E");
   }
   const _comfyui_preset = extension_settings49[extensionName].yushe[_comfyui_yushe_id];
@@ -47280,7 +47399,8 @@ Scheduler: ${payload.scheduler}
           url,
           prompt: payload
         }),
-        headers: getRequestHeaders(window.token)
+        headers: getRequestHeaders(window.token),
+        signal: abortController.signal
       });
       if (!response.ok) {
         const errorText = await response.text();
@@ -47326,7 +47446,6 @@ Scheduler: ${payload.scheduler}
         toastr.success(`\u2705 ComfyUI \u666E\u901A\u751F\u56FE\u5B8C\u6210\uFF0C\u8017\u65F6 ${duration} \u79D2`);
       }
       addLog(`ComfyUI \u666E\u901A\u751F\u56FE\u5B8C\u6210\uFF0C\u8017\u65F6 ${duration} \u79D2`);
-      currentTaskId2 = null;
       console.log("format", format, "isVideo", isVideo);
       if (String(extension_settings49[extensionName].convertToJpegStorage) === "true" && !isVideo) {
         imageUrl = await convertImageToJpeg(imageUrl);
@@ -47341,7 +47460,8 @@ Scheduler: ${payload.scheduler}
       const response = await fetch(urlObj.href, {
         method: "POST",
         body: payload,
-        headers: getComfyUIHeaders("application/json")
+        headers: getComfyUIHeaders("application/json"),
+        signal: abortController.signal
       });
       if (!response.ok) {
         const errorText = await response.text();
@@ -47350,20 +47470,34 @@ Scheduler: ${payload.scheduler}
       }
       const r = await response.json();
       let id = r.prompt_id;
+      const taskCtx = activeComfyuiTasks.get(taskId);
+      if (taskCtx) {
+        taskCtx.promptId = id;
+      }
       detectMultiGpu(url);
       let ii = 0;
+      let mediaInfo = null;
+      const timeoutMs = (parseInt(extension_settings49[extensionName]?.comfyui_timeout, 10) || 1800) * 1e3;
       while (true) {
         try {
-          if (!taskQueue.isTaskInQueue(taskId)) {
+          if (!taskQueue.isTaskInQueue(taskId) || abortController.signal.aborted) {
             addLog("\u4EFB\u52A1\u5DF2\u88AB\u7528\u6237\u53D6\u6D88\uFF0C\u6B63\u5728\u4E2D\u65AD ComfyUI...");
             try {
+              if (id) {
+                fetch(`${url}/queue`, {
+                  method: "POST",
+                  headers: getComfyUIHeaders("application/json"),
+                  body: JSON.stringify({ delete: [id] })
+                }).catch(() => {
+                });
+              }
               await interruptAll(url, { headers: getComfyUIHeaders() });
             } catch (e) {
               console.warn("[ComfyUI] \u4E2D\u65AD\u8BF7\u6C42\u5931\u8D25:", e);
             }
             throw new Error("\u4EFB\u52A1\u5DF2\u53D6\u6D88");
           }
-          const response2 = await fetchHistory(url, id, { headers: getComfyUIHeaders() });
+          const response2 = await fetchHistory(url, id, { headers: getComfyUIHeaders(), signal: abortController.signal });
           if (!response2.ok) {
             addLog(`\u8F6E\u8BE2\u5386\u53F2\u8BB0\u5F55\u65F6\u51FA\u9519: ${response2.status}`);
             throw new Error(`History request failed: ${response2.status}`);
@@ -47441,11 +47575,12 @@ Scheduler: ${payload.scheduler}
             if (!imageInfo) {
               throw new Error("\u672A\u80FD\u4ECEAPI\u54CD\u5E94\u4E2D\u627E\u5230\u6587\u4EF6\u540D\u3002");
             }
+            mediaInfo = imageInfo;
             window._lastMediaInfo = imageInfo;
             const mediaType = imageInfo.isVideo ? "\u89C6\u9891" : "\u56FE\u7247";
             addLog(`${mediaType}\u751F\u6210\u6210\u529F (direct comfyui)\u3002`);
             let fileurl = `${url}/view?filename=${imageInfo.filename}&subfolder=${encodeURIComponent(imageInfo.subfolder)}&type=output`;
-            const imageResponse = await fetch(fileurl, { headers: getComfyUIHeaders() });
+            const imageResponse = await fetch(fileurl, { headers: getComfyUIHeaders(), signal: abortController.signal });
             if (!imageResponse.ok) {
               throw new Error(`\u83B7\u53D6\u56FE\u7247\u5931\u8D25,\u72B6\u6001\u7801: ${imageResponse.status}`);
             }
@@ -47472,6 +47607,7 @@ Scheduler: ${payload.scheduler}
                   console.warn("[ComfyUI] faststart \u5904\u7406\u8DF3\u8FC7/\u5931\u8D25:", err);
                 }
               }
+              mediaInfo.format = correctedMimeType;
               window._lastMediaInfo.format = correctedMimeType;
             }
             imageUrl = await new Promise((resolve, reject) => {
@@ -47489,9 +47625,11 @@ Scheduler: ${payload.scheduler}
           }
           await sleep(1e3);
           ii++;
-          if (ii > 1e3) {
-            addLog("\u8F6E\u8BE2\u8D85\u65F6\uFF081000\u6B21\uFF09\uFF0C\u670D\u52A1\u5668\u53EF\u80FD\u5DF2\u65AD\u5F00\u8FDE\u63A5\u3002");
-            throw new Error("ComfyUI \u670D\u52A1\u5668\u8D85\u65F6\u3002");
+          const elapsed = Date.now() - startTime;
+          if (elapsed > timeoutMs || ii > Math.ceil(timeoutMs / 1e3)) {
+            const minutes = Math.round(timeoutMs / 6e4);
+            addLog(`ComfyUI \u8F6E\u8BE2\u8D85\u65F6\uFF08\u5DF2\u7B49\u5F85 ${(elapsed / 1e3).toFixed(0)} \u79D2 / ${minutes} \u5206\u949F\uFF09\uFF0C\u670D\u52A1\u5668\u53EF\u80FD\u4ECD\u5728\u6392\u961F\u6216\u5DF2\u65AD\u5F00\u8FDE\u63A5\u3002`);
+            throw new Error(`ComfyUI \u670D\u52A1\u5668\u8D85\u65F6\uFF08\u5DF2\u8D85\u8FC7 ${minutes} \u5206\u949F\uFF09\u3002`);
           }
         } catch (error) {
           addLog(`\u8F6E\u8BE2\u65F6\u53D1\u751F\u5F02\u5E38: ${error}`);
@@ -47501,34 +47639,33 @@ Scheduler: ${payload.scheduler}
       if (!imageUrl) {
         throw new Error("\u672A\u80FD\u751F\u6210\u56FE\u7247 URL\u3002");
       }
-      const isVideo = window._lastMediaInfo?.isVideo || false;
-      const mediaFormat = window._lastMediaInfo?.format || "image";
+      const isVideo = mediaInfo?.isVideo ?? (window._lastMediaInfo?.isVideo || false);
+      const mediaFormat = mediaInfo?.format || window._lastMediaInfo?.format || "image";
       const duration = ((Date.now() - startTime) / 1e3).toFixed(1);
       addLog(`\u5A92\u4F53 (${isVideo ? "\u89C6\u9891" : "\u56FE\u7247"}) \u5DF2\u6210\u529F\u83B7\u53D6\u5E76\u683C\u5F0F\u5316\u4E3A data URL (\u8017\u65F6 ${duration} \u79D2)\u3002`);
       taskQueue.completeTask(taskId, true);
       if (!isPluginToastDisabled()) {
         toastr.success(`\u2705 ${taskTypeName}\u5B8C\u6210\uFF0C\u8017\u65F6 ${duration} \u79D2`);
       }
-      currentTaskId2 = null;
       return { image: imageUrl, change: change_ || "", isVideo, format: mediaFormat, genParams: _comfy_gen_params };
     }
   } catch (error) {
     const rawMessage = error instanceof Error ? error.message : String(error);
+    const isAborted = rawMessage === "\u4EFB\u52A1\u5DF2\u53D6\u6D88" || abortController.signal.aborted || !taskQueue.isTaskInQueue(taskId);
     const propagatedMessage = rawMessage === "Failed to fetch" || rawMessage === "Load failed" ? `ComfyUI \u8BF7\u6C42\u5931\u8D25\uFF0C\u53EF\u80FD\u662F\u670D\u52A1\u4E0D\u53EF\u8FBE\u3001\u8DE8\u57DF\u3001\u4EE3\u7406\u5F02\u5E38\u6216\u8FD4\u56DE\u4E86\u65E0\u6548\u54CD\u5E94: ${rawMessage}` : rawMessage;
-    if (rawMessage === "\u4EFB\u52A1\u5DF2\u53D6\u6D88") {
+    if (isAborted) {
       toastr.info(`\u5DF2\u53D6\u6D88 ${taskTypeName}`);
     } else {
       taskQueue.completeTask(taskId, false);
       toastr.error(`${taskTypeName}\u5931\u8D25: ${propagatedMessage}`);
     }
-    currentTaskId2 = null;
     addLog(`[ComfyUI \u9519\u8BEF] ${propagatedMessage}`);
     console.error("Error generating media in ComfyUI:", error);
     throw new Error(propagatedMessage);
   } finally {
+    activeComfyuiTasks.delete(taskId);
     if (lockAcquired) {
-      const interval = Math.max(0, parseInt(extension_settings49[extensionName]?.imageGenInterval, 10) || 0);
-      releaseSerialLock(taskId, interval);
+      releaseComfyUILock(taskId);
     }
   }
 }
@@ -47608,7 +47745,7 @@ async function replaceWithcomfyui() {
     }
   }
 }
-var currentTaskId2, handleComfyuiCancel;
+var activeComfyuiTasks, handleComfyuiCancel;
 var init_comfyui = __esm({
   "utils/comfyui.js"() {
     init_utils();
@@ -47622,17 +47759,54 @@ var init_comfyui = __esm({
     init_imageGenStats();
     init_worker();
     init_comfyuiAdapter();
-    currentTaskId2 = null;
+    activeComfyuiTasks = /* @__PURE__ */ new Map();
     handleComfyuiCancel = async ({ taskId } = {}) => {
-      if (taskId && taskId === currentTaskId2) {
-        console.log("[ComfyUI] \u6536\u5230\u53D6\u6D88\u4E8B\u4EF6\uFF0C\u6B63\u5728\u5411\u670D\u52A1\u5668\u53D1\u9001\u4E2D\u65AD\u8BF7\u6C42:", taskId);
-        const url = (extension_settings49[extensionName]?.comfyuiUrl || "http://localhost:8188").trim();
+      const url = (extension_settings49[extensionName]?.comfyuiUrl || "http://localhost:8188").trim();
+      if (taskId) {
+        const ctx = activeComfyuiTasks.get(taskId);
+        if (ctx) {
+          console.log("[ComfyUI] \u6536\u5230\u5355\u4E2A\u4EFB\u52A1\u53D6\u6D88\u4E8B\u4EF6:", taskId);
+          ctx.abortController.abort();
+          cancelComfyUILock(taskId);
+          if (ctx.promptId && url) {
+            fetch(`${url}/queue`, {
+              method: "POST",
+              headers: getComfyUIHeaders("application/json"),
+              body: JSON.stringify({ delete: [ctx.promptId] })
+            }).catch(() => {
+            });
+          }
+          if (url) {
+            try {
+              await interruptAll(url);
+            } catch (_) {
+            }
+          }
+          activeComfyuiTasks.delete(taskId);
+        } else {
+          cancelComfyUILock(taskId);
+        }
+      } else {
+        console.log("[ComfyUI] \u6536\u5230\u5168\u5C40\u53D6\u6D88\u4E8B\u4EF6\uFF0C\u6B63\u5728\u4E2D\u6B62\u6240\u6709\u6D3B\u52A8\u4EFB\u52A1");
+        for (const [tId, ctx] of activeComfyuiTasks.entries()) {
+          ctx.abortController.abort();
+          cancelComfyUILock(tId);
+          if (ctx.promptId && url) {
+            fetch(`${url}/queue`, {
+              method: "POST",
+              headers: getComfyUIHeaders("application/json"),
+              body: JSON.stringify({ delete: [ctx.promptId] })
+            }).catch(() => {
+            });
+          }
+        }
         if (url) {
           try {
             await interruptAll(url);
           } catch (_) {
           }
         }
+        activeComfyuiTasks.clear();
       }
     };
   }
@@ -47849,7 +48023,7 @@ async function generateBananaImage({ prompt: prompt2, width, height, change, ret
     type: TaskType.BANANA,
     prompt: prompt2
   });
-  currentTaskId3 = taskId;
+  currentTaskId2 = taskId;
   currentAbortController = new AbortController();
   taskQueue.updateStatus(taskId, TaskStatus.RUNNING);
   const startTime = Date.now();
@@ -47973,7 +48147,7 @@ async function generateBananaImage({ prompt: prompt2, width, height, change, ret
             if (!isPluginToastDisabled()) {
               toastr.success(`\u2705 Banana \u89C6\u9891\u751F\u6210\u5B8C\u6210\uFF0C\u8017\u65F6 ${duration} \u79D2`);
             }
-            currentTaskId3 = null;
+            currentTaskId2 = null;
             const changeClean = change.replaceAll("{\u89C6\u9891}", "");
             return { image: videoDataUrl, change: changeClean || prompt2, isVideo: true, format: "video/mp4", originalUrl: videoUrl, genParams: _videoGenParams };
           } catch (fetchError) {
@@ -47990,7 +48164,7 @@ async function generateBananaImage({ prompt: prompt2, width, height, change, ret
       } else {
         taskQueue.completeTask(taskId, false);
       }
-      currentTaskId3 = null;
+      currentTaskId2 = null;
       throw error;
     }
   }
@@ -48219,7 +48393,7 @@ async function generateBananaImage({ prompt: prompt2, width, height, change, ret
       if (!isPluginToastDisabled()) {
         toastr.success(isVideo ? `\u2705 Grok \u89C6\u9891\u751F\u6210\u5B8C\u6210\uFF0C\u8017\u65F6 ${duration} \u79D2` : `\u2705 Grok \u751F\u56FE\u5B8C\u6210\uFF0C\u8017\u65F6 ${duration} \u79D2`);
       }
-      currentTaskId3 = null;
+      currentTaskId2 = null;
       return {
         image: imageUrl,
         change: change_ || "",
@@ -48236,7 +48410,7 @@ async function generateBananaImage({ prompt: prompt2, width, height, change, ret
       } else {
         addLog("[Banana] Grok \u6A21\u5F0F\u751F\u6210\u88AB\u53D6\u6D88\u3002");
       }
-      currentTaskId3 = null;
+      currentTaskId2 = null;
       throw error;
     }
   }
@@ -48464,7 +48638,7 @@ async function generateBananaImage({ prompt: prompt2, width, height, change, ret
             if (!isPluginToastDisabled()) {
               toastr.success(`\u2705 Banana \u89C6\u9891\u751F\u6210\u5B8C\u6210\uFF0C\u8017\u65F6 ${duration2} \u79D2`);
             }
-            currentTaskId3 = null;
+            currentTaskId2 = null;
             return { image: videoDataUrl, change: change_ || "", isVideo: true, format: "video/mp4", originalUrl: videoUrl, genParams: _banana_gen_params };
           } catch (fetchError) {
             addLog(`[Banana] Failed to download video: ${fetchError.message}`);
@@ -48551,7 +48725,7 @@ async function generateBananaImage({ prompt: prompt2, width, height, change, ret
     if (!isPluginToastDisabled()) {
       toastr.success(isGrok ? `\u2705 Grok \u751F\u56FE\u5B8C\u6210\uFF0C\u8017\u65F6 ${duration} \u79D2` : `\u2705 Banana \u751F\u56FE\u5B8C\u6210\uFF0C\u8017\u65F6 ${duration} \u79D2`);
     }
-    currentTaskId3 = null;
+    currentTaskId2 = null;
     return {
       image: imageUrl,
       change: change_ || "",
@@ -48568,7 +48742,7 @@ async function generateBananaImage({ prompt: prompt2, width, height, change, ret
     } else {
       taskQueue.completeTask(taskId, false);
     }
-    currentTaskId3 = null;
+    currentTaskId2 = null;
     throw error;
   }
 }
@@ -48710,7 +48884,7 @@ async function bananaGenerate(requestData) {
 function handleCancelBananaTask(data) {
   const { taskId } = data;
   addLog(`[Banana] \u6536\u5230\u53D6\u6D88\u4EFB\u52A1\u4E8B\u4EF6 (TaskID: ${taskId})`);
-  if (currentTaskId3 === taskId && currentRequestId) {
+  if (currentTaskId2 === taskId && currentRequestId) {
     addLog(`[Banana] \u53D6\u6D88\u5F53\u524D\u4EFB\u52A1\uFF0C\u53D1\u9001\u5931\u8D25\u54CD\u5E94 (ID: ${currentRequestId})`);
     recordImageGeneration("banana", false);
     eventSource22.emit(EventType.GENERATE_IMAGE_RESPONSE, {
@@ -48730,7 +48904,7 @@ function handleCancelBananaTask(data) {
       currentAbortController = null;
       addLog(`[Banana] \u5DF2\u89E6\u53D1 AbortController \u5F7B\u5E95\u4E2D\u65AD\u8BF7\u6C42`);
     }
-    currentTaskId3 = null;
+    currentTaskId2 = null;
     currentRequestId = null;
     currentPrompt = null;
   }
@@ -48756,7 +48930,7 @@ async function replaceWithBanana() {
     }
   }
 }
-var currentTaskId3, currentRequestId, currentPrompt, currentAbortController;
+var currentTaskId2, currentRequestId, currentPrompt, currentAbortController;
 var init_banana = __esm({
   "utils/banana.js"() {
     init_config();
@@ -48769,7 +48943,7 @@ var init_banana = __esm({
     init_taskQueue();
     init_comfyui();
     init_imageGenStats();
-    currentTaskId3 = null;
+    currentTaskId2 = null;
     currentRequestId = null;
     currentPrompt = null;
     currentAbortController = null;
@@ -49026,7 +49200,7 @@ async function generateRunningHubImage({ prompt: link, width: Xwidth, height: Xh
     type: taskType,
     prompt: link
   });
-  currentTaskId4 = taskId;
+  currentTaskId3 = taskId;
   const startTime = Date.now();
   if (!isPluginToastDisabled()) {
     toastr.info(`\u{1F3A8} \u5DF2\u53D1\u8D77 ${taskTypeName} \u8BF7\u6C42...`);
@@ -49084,12 +49258,12 @@ async function generateRunningHubImage({ prompt: link, width: Xwidth, height: Xh
   const workflowId = targetWorkflowId;
   if (!rawApiKey) {
     taskQueue.completeTask(taskId, false);
-    currentTaskId4 = null;
+    currentTaskId3 = null;
     throw new Error("\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u586B\u5199 RunningHub API Key");
   }
   if (!workflowId) {
     taskQueue.completeTask(taskId, false);
-    currentTaskId4 = null;
+    currentTaskId3 = null;
     throw new Error(`\u5F53\u524D\u3010${workflowCategoryName}\u3011\u9009\u4E2D\u7684\u9884\u8BBE "${targetWorkerid}" \u5C1A\u672A\u914D\u7F6E\u5DE5\u4F5C\u6D41 ID\uFF0C\u8BF7\u5728\u5DE5\u4F5C\u6D41\u8BBE\u7F6E\u4E2D\u586B\u5199`);
   }
   addLog(`\u5F00\u59CB RunningHub \u751F\u56FE\u6D41\u7A0B\u3002\u5DE5\u4F5C\u6D41\u5206\u7C7B: \u3010${workflowCategoryName}\u3011\uFF0C\u5DE5\u4F5C\u6D41 ID: ${workflowId}`);
@@ -49388,7 +49562,7 @@ async function generateRunningHubImage({ prompt: link, width: Xwidth, height: Xh
         recordKeyConsumption(apiKey, rhConsumeCoins);
       }
     }
-    currentTaskId4 = null;
+    currentTaskId3 = null;
     return {
       image: finalImageData,
       change: change_ || "",
@@ -49406,7 +49580,7 @@ async function generateRunningHubImage({ prompt: link, width: Xwidth, height: Xh
       recordImageGeneration("runninghub", false);
       toastr.error(`RunningHub \u751F\u56FE\u5931\u8D25: ${rawMessage}`);
     }
-    currentTaskId4 = null;
+    currentTaskId3 = null;
     addLog(`[RunningHub \u9519\u8BEF] ${rawMessage}`);
     console.error("[RunningHub \u9519\u8BEF]", err);
     throw err;
@@ -49510,7 +49684,7 @@ async function replaceWithRunningHub() {
     }
   }
 }
-var currentTaskId4;
+var currentTaskId3;
 var init_runninghub = __esm({
   "utils/runninghub.js"() {
     init_utils();
@@ -49525,7 +49699,7 @@ var init_runninghub = __esm({
     init_runninghubKeyManager();
     init_runninghubVideo();
     init_runninghubScheduler();
-    currentTaskId4 = null;
+    currentTaskId3 = null;
   }
 });
 
@@ -50771,6 +50945,7 @@ function unregisterActiveComfyUIVideoTask(taskId) {
   activeComfyUIVideoTasks.delete(taskId);
 }
 async function abortComfyUIVideoTask(taskId) {
+  cancelComfyUILock(taskId);
   const taskCtx = activeComfyUIVideoTasks.get(taskId);
   if (!taskCtx) return;
   console.log(`[ComfyUIVideo] \u89E6\u53D1\u4EFB\u52A1\u4E2D\u65AD: ${taskId}`);
@@ -50780,6 +50955,14 @@ async function abortComfyUIVideoTask(taskId) {
     } catch (e) {
       console.warn("[ComfyUIVideo] abortController.abort \u5931\u8D25:", e);
     }
+  }
+  if (taskCtx.promptId && taskCtx.url) {
+    fetch(`${taskCtx.url}/queue`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ delete: [taskCtx.promptId] })
+    }).catch(() => {
+    });
   }
   if (taskCtx.url) {
     try {
@@ -51494,17 +51677,7 @@ async function generateComfyUIRefVideo({ prompt: rawPrompt, width: Xwidth, heigh
       steps: settings3.comfyui_val_steps,
       duration: settings3.comfyui_val_duration
     });
-    while (!window.xiancheng) {
-      if (!taskQueue.isTaskInQueue(taskId) || abortController.signal.aborted) {
-        addLog("[ComfyUIVideo] \u4EFB\u52A1\u5DF2\u88AB\u7528\u6237\u53D6\u6D88");
-        throw new Error("\u4EFB\u52A1\u5DF2\u53D6\u6D88");
-      }
-      await sleep(1e3);
-    }
-    if (!taskQueue.isTaskInQueue(taskId) || abortController.signal.aborted) {
-      throw new Error("\u4EFB\u52A1\u5DF2\u53D6\u6D88");
-    }
-    window.xiancheng = false;
+    await acquireComfyUILock(taskId, abortController.signal);
     lockAcquired = true;
     taskQueue.updateStatus(taskId, "running");
     const clientId = "533ef3a3-39c0-4e39-9ced-37d290f371f8";
@@ -51640,8 +51813,11 @@ async function generateComfyUIRefVideo({ prompt: rawPrompt, width: Xwidth, heigh
           break;
         }
       }
-      if (attempts > 1200) {
-        throw new Error("ComfyUI \u89C6\u9891\u751F\u6210\u8D85\u65F6 (20\u5206\u949F)");
+      const timeoutMs = (parseInt(settings3.comfyui_timeout, 10) || 1800) * 1e3;
+      const elapsed = Date.now() - startTime;
+      if (elapsed > timeoutMs || attempts > Math.ceil(timeoutMs / 1e3)) {
+        const minutes = Math.round(timeoutMs / 6e4);
+        throw new Error(`ComfyUI \u89C6\u9891\u751F\u6210\u8D85\u65F6\uFF08\u5DF2\u8D85\u8FC7 ${minutes} \u5206\u949F\uFF09`);
       }
     }
     const duration = ((Date.now() - startTime) / 1e3).toFixed(1);
@@ -51657,9 +51833,6 @@ async function generateComfyUIRefVideo({ prompt: rawPrompt, width: Xwidth, heigh
       genParams: _comfy_gen_params
     };
   } catch (err) {
-    if (lockAcquired) {
-      window.xiancheng = true;
-    }
     const isAborted = err.message === "\u4EFB\u52A1\u5DF2\u53D6\u6D88" || abortController.signal.aborted || !taskQueue.isTaskInQueue(taskId);
     const rawMessage = err instanceof Error ? err.message : String(err);
     if (isAborted) {
@@ -51677,9 +51850,7 @@ async function generateComfyUIRefVideo({ prompt: rawPrompt, width: Xwidth, heigh
   } finally {
     unregisterActiveComfyUIVideoTask(taskId);
     if (lockAcquired) {
-      setTimeout(() => {
-        window.xiancheng = true;
-      }, settings3.imageGenInterval || 1e3);
+      releaseComfyUILock(taskId);
     }
   }
 }
@@ -53562,21 +53733,14 @@ function isButtonEligibleForAutoClick(button) {
     const createdAt = Number(button.dataset.createdAt || 0);
     const triggerStartTime = Number(window.zidongdianjiStartTime || 0);
     const now = Date.now();
-    if (triggerStartTime > 0 && now - triggerStartTime > 15e3) {
+    if (triggerStartTime <= 0 || now - triggerStartTime > 15e3) {
       return false;
     }
-    const isFreshButton = createdAt > 0 && now - createdAt <= 6e4;
-    if (!isFreshButton) {
-      const mesContainer = button.closest?.(".mes[mesid]");
-      if (mesContainer) {
-        const allMes = document.querySelectorAll("#chat .mes[mesid]");
-        if (allMes.length > 0) {
-          const mesIndex = Array.prototype.indexOf.call(allMes, mesContainer);
-          if (mesIndex !== -1 && mesIndex < allMes.length - 2) {
-            return false;
-          }
-        }
-      }
+    if (createdAt <= 0 || now - createdAt > 6e4) {
+      return false;
+    }
+    if (createdAt < triggerStartTime - 15e3) {
+      return false;
     }
   }
   return true;
@@ -53700,7 +53864,8 @@ async function findAndReplaceInElement(rootElement, imageAlt = "Generated Image"
     const startedAt = Number(loadingButton.dataset.loadingStartedAt || 0);
     const btnLink = loadingButton.dataset.link || loadingButton.dataset.imageTag;
     const generating = btnLink ? isGenerating(btnLink) : false;
-    const isStale = startedAt > 0 && Date.now() - startedAt > 9e4 || !generating && startedAt > 0 && Date.now() - startedAt > 1e4;
+    const maxTimeoutMs = Math.max(18e5, (parseInt(settings3?.comfyui_timeout, 10) || 1800) * 1e3);
+    const isStale = !generating && startedAt > 0 && Date.now() - startedAt > 1e4 || startedAt > 0 && Date.now() - startedAt > maxTimeoutMs;
     if (isStale) {
       console.warn("[iframe] \u68C0\u6D4B\u5230\u9648\u65E7 loading \u6B7B\u9501\u6309\u94AE\uFF0C\u81EA\u52A8\u590D\u4F4D\u81EA\u6108:", btnLink);
       loadingButton.removeAttribute("data-loading");
@@ -79689,7 +79854,7 @@ function getDirectHeaders2(contentType = null, auth = null) {
   }
   return headers;
 }
-var currentTaskId5 = null;
+var currentTaskId4 = null;
 async function generateSDImage({ prompt: link, width: Xwidth, height: Xheight, change, extraNegativePrompt }) {
   clearLog();
   const taskId = taskQueue.addTask({
@@ -79697,7 +79862,7 @@ async function generateSDImage({ prompt: link, width: Xwidth, height: Xheight, c
     type: TaskType.SD,
     prompt: link
   });
-  currentTaskId5 = taskId;
+  currentTaskId4 = taskId;
   let lockAcquired = false;
   await acquireSerialLock(taskId);
   lockAcquired = true;
@@ -79777,7 +79942,7 @@ async function generateSDImage({ prompt: link, width: Xwidth, height: Xheight, c
   if (!extension_settings58[extensionName].yushe || !extension_settings58[extensionName].yushe[_sd_yushe_id]) {
     toastr.error("\u672A\u80FD\u627E\u5230\u6240\u9009\u7684\u56FA\u5B9A\u63D0\u793A\u8BCD\u9884\u8BBE\u3002\u8BF7\u524D\u5F80\u63D2\u4EF6\u8BBE\u7F6E\u4E2D\u65B0\u5EFA\u6216\u9009\u62E9\u4E00\u4E2A\u56FA\u5B9A\u63D0\u793A\u8BCD\u3002", "SD \u751F\u56FE\u9519\u8BEF");
     taskQueue.completeTask(taskId, false);
-    currentTaskId5 = null;
+    currentTaskId4 = null;
     throw new Error("\u56FA\u5B9A\u63D0\u793A\u8BCD\u9884\u8BBE\u672A\u914D\u7F6E");
   }
   const _sd_preset = extension_settings58[extensionName].yushe[_sd_yushe_id];
@@ -79855,7 +80020,7 @@ async function generateSDImage({ prompt: link, width: Xwidth, height: Xheight, c
   } catch (error) {
     addLog(`\u83B7\u53D6\u6216\u8005\u5207\u6362\u6A21\u578B\u5931\u8D25: ${error.message}\u3002\u8BF7\u68C0\u67E5sdwebui\u662F\u5426\u6B63\u5E38\u542F\u52A8\uFF0C\u5E76\u68C0\u67E5\u6A21\u578B\u662F\u5426\u6B63\u786E\u3002`);
     taskQueue.completeTask(taskId, false);
-    currentTaskId5 = null;
+    currentTaskId4 = null;
     throw new Error(`\u83B7\u53D6\u6216\u8005\u5207\u6362\u6A21\u578B\u5931\u8D25\uFF0C\u8BF7\u68C0\u67E5sdwebui\u662F\u5426\u6B63\u5E38\u542F\u52A8\uFF0C\u5E76\u68C0\u67E5\u6A21\u578B\u662F\u5426\u6B63\u786E\u3002`);
   }
   let seed = -1;
@@ -79982,7 +80147,7 @@ async function generateSDImage({ prompt: link, width: Xwidth, height: Xheight, c
       if (!isPluginToastDisabled()) {
         toastr.success(`\u2705 SD \u751F\u56FE\u5B8C\u6210\uFF0C\u8017\u65F6 ${duration} \u79D2`);
       }
-      currentTaskId5 = null;
+      currentTaskId4 = null;
       if (String(extension_settings58[extensionName].convertToJpegStorage) === "true") {
         imageUrl = await convertImageToJpeg(imageUrl);
       }
@@ -80012,7 +80177,7 @@ async function generateSDImage({ prompt: link, width: Xwidth, height: Xheight, c
       if (!isPluginToastDisabled()) {
         toastr.success(`\u2705 SD \u751F\u56FE\u5B8C\u6210\uFF0C\u8017\u65F6 ${duration} \u79D2`);
       }
-      currentTaskId5 = null;
+      currentTaskId4 = null;
       if (String(extension_settings58[extensionName].convertToJpegStorage) === "true") {
         imageUrl = await convertImageToJpeg(imageUrl);
       }
@@ -80023,7 +80188,7 @@ async function generateSDImage({ prompt: link, width: Xwidth, height: Xheight, c
     } else {
       taskQueue.completeTask(taskId, false);
     }
-    currentTaskId5 = null;
+    currentTaskId4 = null;
     addLog(`sd\u8BF7\u6C42\u751F\u56FE\u9519\u8BEF: ${error.message}`);
     console.error("Error generating image:", error);
     throw error;
@@ -83310,6 +83475,7 @@ function initVibeGroupEditor(settingsModal) {
 
 // utils/novelai.js
 init_genParams();
+var NOVELAI_TIMEOUT_SECONDS = 300;
 function isSettingTrue3(val) {
   return val === true || val === "true";
 }
@@ -83878,32 +84044,114 @@ async function applyCharacterReferenceGroup(preset_data) {
     toastr.error("\u6240\u6709\u89D2\u8272\u53C2\u8003\u5904\u7406\u5931\u8D25\uFF0C\u5C06\u4E0D\u4F7F\u7528\u89D2\u8272\u53C2\u8003", "\u89D2\u8272\u53C2\u8003");
   }
 }
-function unzipFile(arrayBuffer) {
+async function unzipFile(inputData) {
   addLog("\u5F00\u59CB\u89E3\u538B ZIP \u6587\u4EF6...");
   const JSZipConstructor = window.stChatu8JSZip || window.JSZip;
   if (!JSZipConstructor || typeof JSZipConstructor.loadAsync !== "function") {
     const error = new Error("JSZip \u4E0D\u53EF\u7528\uFF0C\u65E0\u6CD5\u89E3\u538B ZIP \u6587\u4EF6");
     addLog(error.message);
-    return Promise.reject(error);
+    throw error;
   }
-  return new Promise((resolve, reject) => {
-    JSZipConstructor.loadAsync(arrayBuffer).then(function(zip) {
-      addLog("ZIP \u6587\u4EF6\u52A0\u8F7D\u6210\u529F");
-      zip.forEach(function(relativePath, zipEntry) {
-        addLog(`\u5728 ZIP \u4E2D\u627E\u5230\u6587\u4EF6: ${zipEntry.name}`);
-        zipEntry.async("base64").then(function(base64String) {
-          addLog(`\u6587\u4EF6 ${zipEntry.name} \u89E3\u538B\u4E3A Base64\uFF0C\u5927\u5C0F: ${base64String.length}`);
-          resolve(base64String);
-        }).catch((err) => {
-          addLog(`\u89E3\u538B\u6587\u4EF6 ${zipEntry.name} \u5931\u8D25: ${err.message}`);
-          reject(err);
-        });
-      });
-    }).catch((err) => {
-      addLog(`\u52A0\u8F7D ZIP \u6587\u4EF6\u5931\u8D25: ${err.message}`);
-      reject(err);
-    });
-  });
+  if (!inputData) {
+    throw new Error("\u89E3\u538B\u6570\u636E\u4E3A\u7A7A");
+  }
+  if (typeof inputData === "string") {
+    const trimmed = inputData.trim();
+    if (trimmed.startsWith("data:image/")) {
+      const commaIdx = trimmed.indexOf(",");
+      return commaIdx !== -1 ? trimmed.substring(commaIdx + 1) : trimmed;
+    }
+    if (trimmed.startsWith("iVBORw0KGgo")) {
+      return trimmed;
+    }
+  }
+  let uint8Data = null;
+  if (inputData instanceof Uint8Array) {
+    uint8Data = new Uint8Array(inputData.buffer, inputData.byteOffset, inputData.byteLength);
+  } else if (inputData instanceof ArrayBuffer || Object.prototype.toString.call(inputData) === "[object ArrayBuffer]") {
+    uint8Data = new Uint8Array(inputData);
+  } else if (typeof Blob !== "undefined" && inputData instanceof Blob) {
+    const ab = await inputData.arrayBuffer();
+    uint8Data = new Uint8Array(ab);
+  }
+  let zipPayload = inputData;
+  let loadOptions = {};
+  if (uint8Data) {
+    const isZipBinary = uint8Data.length >= 2 && uint8Data[0] === 80 && uint8Data[1] === 75;
+    const isPngBinary = uint8Data.length >= 4 && uint8Data[0] === 137 && uint8Data[1] === 80 && uint8Data[2] === 78 && uint8Data[3] === 71;
+    if (isPngBinary) {
+      addLog("\u68C0\u6D4B\u5230\u8FD4\u56DE\u5185\u5BB9\u4E3A\u539F\u59CB PNG \u4E8C\u8FDB\u5236\uFF0C\u76F4\u63A5\u8F6C\u6362\u4E3A Base64");
+      return uint8ArrayToBase642(uint8Data);
+    }
+    if (isZipBinary) {
+      zipPayload = uint8Data;
+    } else {
+      try {
+        const text = new TextDecoder().decode(uint8Data).trim();
+        if (text.startsWith("UEsDB")) {
+          zipPayload = text;
+          loadOptions = { base64: true };
+        } else if (text.startsWith("iVBORw0KGgo") || text.startsWith("data:image/")) {
+          const commaIdx = text.indexOf(",");
+          return commaIdx !== -1 ? text.substring(commaIdx + 1) : text;
+        } else if (text.startsWith("{")) {
+          const parsed = JSON.parse(text);
+          if (parsed.images && parsed.images[0]) return parsed.images[0];
+          if (parsed.image) return parsed.image;
+        } else {
+          zipPayload = uint8Data;
+        }
+      } catch (_) {
+        zipPayload = uint8Data;
+      }
+    }
+  } else if (typeof inputData === "string") {
+    zipPayload = inputData.trim();
+    loadOptions = { base64: true };
+  }
+  try {
+    const zip = await JSZipConstructor.loadAsync(zipPayload, loadOptions);
+    addLog("ZIP \u6587\u4EF6\u52A0\u8F7D\u6210\u529F");
+    let targetEntry = null;
+    const allFileNames = Object.keys(zip.files);
+    for (const fname of allFileNames) {
+      const entry = zip.files[fname];
+      if (entry && !entry.dir) {
+        const lower = fname.toLowerCase();
+        if (lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".webp")) {
+          targetEntry = entry;
+          break;
+        }
+      }
+    }
+    if (!targetEntry) {
+      for (const fname of allFileNames) {
+        const entry = zip.files[fname];
+        if (entry && !entry.dir) {
+          targetEntry = entry;
+          break;
+        }
+      }
+    }
+    if (!targetEntry) {
+      throw new Error("ZIP \u538B\u7F29\u5305\u4E2D\u672A\u627E\u5230\u4EFB\u4F55\u6709\u6548\u56FE\u50CF\u6587\u4EF6");
+    }
+    addLog(`\u5728 ZIP \u4E2D\u63D0\u53D6\u6587\u4EF6: ${targetEntry.name}`);
+    const base64String = await targetEntry.async("base64");
+    addLog(`\u6587\u4EF6 ${targetEntry.name} \u89E3\u538B\u4E3A Base64\uFF0C\u5927\u5C0F: ${base64String.length}`);
+    return base64String;
+  } catch (err) {
+    addLog(`\u52A0\u8F7D/\u89E3\u538B ZIP \u6587\u4EF6\u5931\u8D25: ${err.message}`);
+    throw err;
+  }
+}
+function uint8ArrayToBase642(uint8Array) {
+  let binary = "";
+  const len = uint8Array.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(uint8Array[i]);
+  }
+  return btoa(binary);
 }
 async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheight, change, extraNegativePrompt }) {
   clearLog();
@@ -83915,7 +84163,7 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
   const abortController = new AbortController();
   activeAbortControllers.set(taskId, abortController);
   let timeoutId = null;
-  const resetGenerationTimeout = (sec = 120) => {
+  const resetGenerationTimeout = (sec = NOVELAI_TIMEOUT_SECONDS) => {
     if (timeoutId) clearTimeout(timeoutId);
     timeoutId = setTimeout(() => {
       try {
@@ -83929,7 +84177,7 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
   await acquireSerialLock(taskId, abortController.signal);
   lockAcquired = true;
   taskQueue.updateStatus(taskId, TaskStatus.RUNNING);
-  resetGenerationTimeout(120);
+  resetGenerationTimeout(NOVELAI_TIMEOUT_SECONDS);
   const startTime = Date.now();
   if (!isPluginToastDisabled()) {
     toastr.info("\u{1F3A8} \u5DF2\u53D1\u8D77 NovelAI \u751F\u56FE\u8BF7\u6C42...");
@@ -84450,7 +84698,7 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
         throw error;
       }
     }
-    resetGenerationTimeout(120);
+    resetGenerationTimeout(NOVELAI_TIMEOUT_SECONDS);
     if (extension_settings62[extensionName].client == "jiuguan") {
       const read = await fetch("/api/secrets/read", {
         method: "POST",
@@ -84620,7 +84868,7 @@ async function generateNovelAIInpaint({ prompt: link, width: Xwidth, height: Xhe
   const abortController = new AbortController();
   activeAbortControllers.set(taskId, abortController);
   let timeoutId = null;
-  const resetInpaintTimeout = (sec = 120) => {
+  const resetInpaintTimeout = (sec = NOVELAI_TIMEOUT_SECONDS) => {
     if (timeoutId) clearTimeout(timeoutId);
     timeoutId = setTimeout(() => {
       try {
@@ -84634,7 +84882,7 @@ async function generateNovelAIInpaint({ prompt: link, width: Xwidth, height: Xhe
   await acquireSerialLock(taskId, abortController.signal);
   lockAcquired = true;
   taskQueue.updateStatus(taskId, TaskStatus.RUNNING);
-  resetInpaintTimeout(120);
+  resetInpaintTimeout(NOVELAI_TIMEOUT_SECONDS);
   const inpaintStartTime = Date.now();
   if (!isPluginToastDisabled()) {
     toastr.info("\u{1F3A8} \u5DF2\u53D1\u8D77 NovelAI \u5C40\u90E8\u91CD\u7ED8\u8BF7\u6C42...");
@@ -84749,7 +84997,7 @@ async function generateNovelAIInpaint({ prompt: link, width: Xwidth, height: Xhe
         throw error;
       }
     }
-    resetInpaintTimeout(120);
+    resetInpaintTimeout(NOVELAI_TIMEOUT_SECONDS);
     if (extension_settings62[extensionName].novelaisite != "\u5B98\u7F51" && extension_settings62[extensionName].client == "jiuguan") {
       throw new Error("\u9152\u9986\u7AEF\u4E0D\u652F\u6301\u81EA\u5B9A\u4E49\u7AD9\u70B9\u7684\u5C40\u90E8\u91CD\u7ED8\uFF01");
     }
@@ -86132,8 +86380,7 @@ var typeTexts = {
   [TaskType.AUTO_CLICK]: "\u81EA\u52A8\u70B9\u51FB",
   [TaskType.LLM]: "LLM \u8BF7\u6C42",
   [TaskType.BANANA]: "Banana \u751F\u56FE",
-  [TaskType.SD]: "SD \u751F\u56FE",
-  [TaskType.PREGEN]: "\u6D41\u5F0F\u9884\u751F\u6210"
+  [TaskType.SD]: "SD \u751F\u56FE"
 };
 function renderTaskList(tasks) {
   const container = document.getElementById("ch-task-list");
@@ -86185,10 +86432,7 @@ function handleCancelTask(taskId) {
   }
   cancelSerialLock(taskId);
   const wasRunning = taskQueue.cancelTask(taskId);
-  if (task.type === TaskType.PREGEN) {
-    eventSource32.emit("st_chatu8_cancel_pregen_task", { taskId });
-    console.log("[TaskManager] \u5DF2\u89E6\u53D1\u9884\u751F\u6210\u53D6\u6D88\u4E8B\u4EF6:", taskId);
-  } else if (task.type === TaskType.AUTO_CLICK) {
+  if (task.type === TaskType.AUTO_CLICK) {
     window.zidongdianji = false;
     console.log("[TaskManager] \u5DF2\u505C\u6B62\u81EA\u52A8\u70B9\u51FB\u4EFB\u52A1");
   } else if (task.type === TaskType.LLM) {
@@ -86230,7 +86474,6 @@ function handleCancelAll() {
   for (const task of runningTasks) {
     handleCancelTask(task.id);
   }
-  eventSource32.emit("st_chatu8_cancel_pregen_task", {});
   eventSource32.emit("st_chatu8_cancel_novelai_task", {});
   eventSource32.emit("st_chatu8_cancel_banana_task", {});
   eventSource32.emit("st_chatu8_cancel_runninghub_task", {});
@@ -90982,7 +91225,7 @@ async function sha256(message) {
   const combined = (timestamp + random + hashHex + message.substring(0, 20)).replace(/[^0-9a-f]/g, "0");
   return combined.padEnd(64, "0").substring(0, 64);
 }
-function uint8ArrayToBase642(uint8Array) {
+function uint8ArrayToBase643(uint8Array) {
   let binary = "";
   const chunkSize = 8192;
   for (let i = 0; i < uint8Array.length; i += chunkSize) {
@@ -91748,7 +91991,7 @@ function showVibeGeneratorDialog() {
       });
       const arrayBuffer = await response.arrayBuffer();
       const vibeUint8 = new Uint8Array(arrayBuffer);
-      const vibeBase64 = uint8ArrayToBase642(vibeUint8);
+      const vibeBase64 = uint8ArrayToBase643(vibeUint8);
       console.log(`[Vibe] encoding \u539F\u59CB\u5B57\u8282: ${vibeUint8.length} bytes, base64 \u957F\u5EA6: ${vibeBase64.length}`);
       if (vibeUint8.length < 100) {
         throw new Error(`encoding \u6570\u636E\u5F02\u5E38 (\u4EC5 ${vibeUint8.length} bytes)\uFF0CAPI \u53EF\u80FD\u8FD4\u56DE\u4E86\u9519\u8BEF\u54CD\u5E94`);
@@ -110603,7 +110846,7 @@ async function initUI({ check_update: check_update2 }) {
       settings2.theme_id = "\u9ED8\u8BA4-\u767D\u5929";
     }
     applyTheme(settings2.themes[settings2.theme_id]);
-    const mainKeys = ["scriptEnabled", "helpTipsEnabled", "disablePluginToast", "newlineFixEnabled", "mode", "client", "displayMode", "heavyFrontendMode", "insertOriginalText", "dbclike", "collapseImage", "zidongdianji", "zidongdianji2", "longPressToEdit", "clickToPreview", "startTag", "endTag", "cache", "sdUrl", "st_chatu8_sd_auth", "comfyuiUrl", "novelaiApi", "novelaisite", "novelaiOtherSite", "enableCloudQueue", "cloudQueueUrl", "cloudQueueGreeting", "showQueueGreeting", "novelaimode", "novelai_sampler", "Schedule", "nai3Scale", "cfg_rescale", "AI_use_coords", "sm", "dyn", "nai3Variety", "nai3Deceisp", "sd_cwidth", "sd_cheight", "sd_csteps", "sd_cseed", "sdCfgScale", "restoreFaces", "novelai_width", "novelai_height", "novelai_steps", "novelai_seed", "nai3VibeTransfer", "enableVibeGroupTransfer", "randomVibeGroup", "normalizeRefStrength", "InformationExtracted", "ReferenceStrength", "nai3CharRef", "nai3StylePerception", "comfyui_width", "comfyui_height", "comfyui_steps", "comfyui_seed", "cfg_comfyui", "worker", "ipa", "c_fenwei", "c_xijie", "c_quanzhong", "c_idquanzhong", "AQT_sd", "UCP_sd", "AQT_novelai", "UCP_novelai", "AQT_comfyui", "UCP_comfyui", "addFurryDataset", "sd_cupscale_factor", "sd_chires_fix", "sd_chires_steps", "sd_cdenoising_strength", "sd_cclip_skip", "sd_cadetailer", "worldBookEnabled", "ai_temperature", "ai_top_p", "ai_presence_penalty", "ai_frequency_penalty", "ai_stream", "ai_private", "ai_token", "vocabulary_search_startswith", "vocabulary_search_limit", "vocabulary_search_sort", "enablePregen", "autoLLMImageGen", "randomYushe", "aiAutonomousResolution", "videoChannel", "imageAlignment", "imageSizeScale", "imageGenInterval", "translation_system_prompt", "ai_test_system", "ai_test_user", "ai_test_output", "jiuguanchucun", "vibeJiuguanchucun", "convertToJpegStorage", "weilin_lora_fix"];
+    const mainKeys = ["scriptEnabled", "helpTipsEnabled", "disablePluginToast", "newlineFixEnabled", "mode", "client", "displayMode", "heavyFrontendMode", "insertOriginalText", "dbclike", "collapseImage", "zidongdianji", "zidongdianji2", "longPressToEdit", "clickToPreview", "startTag", "endTag", "cache", "sdUrl", "st_chatu8_sd_auth", "comfyuiUrl", "comfyui_max_concurrency", "comfyui_timeout", "novelaiApi", "novelaisite", "novelaiOtherSite", "enableCloudQueue", "cloudQueueUrl", "cloudQueueGreeting", "showQueueGreeting", "novelaimode", "novelai_sampler", "Schedule", "nai3Scale", "cfg_rescale", "AI_use_coords", "sm", "dyn", "nai3Variety", "nai3Deceisp", "sd_cwidth", "sd_cheight", "sd_csteps", "sd_cseed", "sdCfgScale", "restoreFaces", "novelai_width", "novelai_height", "novelai_steps", "novelai_seed", "nai3VibeTransfer", "enableVibeGroupTransfer", "randomVibeGroup", "normalizeRefStrength", "InformationExtracted", "ReferenceStrength", "nai3CharRef", "nai3StylePerception", "comfyui_width", "comfyui_height", "comfyui_steps", "comfyui_seed", "cfg_comfyui", "worker", "ipa", "c_fenwei", "c_xijie", "c_quanzhong", "c_idquanzhong", "AQT_sd", "UCP_sd", "AQT_novelai", "UCP_novelai", "AQT_comfyui", "UCP_comfyui", "addFurryDataset", "sd_cupscale_factor", "sd_chires_fix", "sd_chires_steps", "sd_cdenoising_strength", "sd_cclip_skip", "sd_cadetailer", "worldBookEnabled", "ai_temperature", "ai_top_p", "ai_presence_penalty", "ai_frequency_penalty", "ai_stream", "ai_private", "ai_token", "vocabulary_search_startswith", "vocabulary_search_limit", "vocabulary_search_sort", "enablePregen", "autoLLMImageGen", "randomYushe", "aiAutonomousResolution", "videoChannel", "imageAlignment", "imageSizeScale", "imageGenInterval", "translation_system_prompt", "ai_test_system", "ai_test_user", "ai_test_output", "jiuguanchucun", "vibeJiuguanchucun", "convertToJpegStorage", "weilin_lora_fix"];
     mainKeys.forEach((key) => {
       const element = document.getElementById(key);
       if (element) {
@@ -110614,6 +110857,9 @@ async function initUI({ check_update: check_update2 }) {
         }
       }
     });
+    if (settings2.comfyui_max_concurrency) {
+      comfyuiConcurrencyLock.setMaxConcurrency(settings2.comfyui_max_concurrency);
+    }
     if (settings2.novelaimode) {
       loadModelConfigIntoUI(settings2.novelaimode);
     }
@@ -111836,6 +112082,12 @@ async function initUI({ check_update: check_update2 }) {
         if (settingKey === "videoChannel") {
           updateModeNavVisibility(settingsModal);
         }
+        if (settingKey === "comfyui_max_concurrency") {
+          const parsedMax = parseInt(value, 10);
+          if (!isNaN(parsedMax) && parsedMax > 0) {
+            comfyuiConcurrencyLock.setMaxConcurrency(parsedMax);
+          }
+        }
         if (settingKey === "imageAlignment" || settingKey === "imageSizeScale") {
           const currentTheme = settings2.themes?.[settings2.theme_id] || {};
           applyImageFrameStyle(settings2.image_frame_style || "\u65E0\u6837\u5F0F", isThemeDark(currentTheme));
@@ -111964,7 +112216,6 @@ init_utils();
 init_generation_status();
 init_placeholder();
 init_database();
-init_taskQueue();
 
 
 function generateStableId3(str) {
@@ -111979,104 +112230,37 @@ function generateStableId3(str) {
 var pregenDispatched = /* @__PURE__ */ new Set();
 var currentSessionEpoch = 0;
 var activeTaskCleanups = /* @__PURE__ */ new Set();
-var taskIdToCleanup = /* @__PURE__ */ new Map();
-var promptToTaskId = /* @__PURE__ */ new Map();
-function setupCancelListeners() {
-  const handleCancel = ({ taskId } = {}) => {
-    if (taskId) {
-      const cleanup = taskIdToCleanup.get(taskId);
-      if (cleanup) {
-        try {
-          cleanup();
-        } catch (e) {
-          console.error("[Pregen] \u53D6\u6D88\u4EFB\u52A1\u6E05\u7406\u5931\u8D25:", e);
-        }
-        taskIdToCleanup.delete(taskId);
-      }
-      taskQueue.updateStatus(taskId, TaskStatus.CANCELLED);
-      addLog(`[Pregen] \u9884\u751F\u6210\u4EFB\u52A1\u5DF2\u53D6\u6D88 (ID: ${taskId})`);
-    } else {
-      cancelAllPregenTasks();
-    }
-  };
-  eventSource46.on("st_chatu8_cancel_pregen_task", handleCancel);
-  eventSource46.on("st_chatu8_cancel_task", handleCancel);
-}
-setupCancelListeners();
-function cancelAllPregenTasks() {
-  currentSessionEpoch++;
-  pregenDispatched.clear();
-  for (const [norm, taskId] of promptToTaskId) {
-    if (taskQueue.isTaskInQueue(taskId)) {
-      taskQueue.updateStatus(taskId, TaskStatus.CANCELLED);
-    }
-  }
-  promptToTaskId.clear();
-  for (const [taskId, cleanup] of taskIdToCleanup) {
-    try {
-      cleanup();
-    } catch (e) {
-      console.error("[Pregen] \u6E05\u7406\u5728\u9014\u4EFB\u52A1\u5931\u8D25:", e);
-    }
-  }
-  taskIdToCleanup.clear();
-  for (const cleanup of activeTaskCleanups) {
-    try {
-      cleanup();
-    } catch (e) {
-      console.error("[Pregen] \u6E05\u7406\u5728\u9014\u4EFB\u52A1\u5931\u8D25:", e);
-    }
-  }
-  activeTaskCleanups.clear();
-  clearAllGenerating();
-  addLog(`[Pregen] \u6240\u6709\u9884\u751F\u6210\u4EFB\u52A1\u5DF2\u5168\u90E8\u53D6\u6D88\u5E76\u6E05\u7A7A\u72B6\u6001 (epoch: ${currentSessionEpoch})\u3002`);
-}
-async function dispatchPregenTask(normPrompt, taskId, requestId) {
+async function dispatchPregenTask(normPrompt) {
   const taskEpoch = currentSessionEpoch;
   let cleanup = null;
-  const onTaskFinish = (success = true) => {
+  const onTaskFinish = () => {
     if (cleanup) {
       cleanup();
       activeTaskCleanups.delete(cleanup);
-      if (taskId) taskIdToCleanup.delete(taskId);
       cleanup = null;
     }
     if (taskEpoch !== currentSessionEpoch) {
       addLog(`[Pregen] \u4EFB\u52A1\u6240\u5C5E\u4F1A\u8BDD\u5DF2\u8FC7\u671F (epoch: ${taskEpoch} vs ${currentSessionEpoch})\uFF0C\u5FFD\u7565\u4EFB\u52A1\u7ED3\u675F\u56DE\u8C03`);
       return;
     }
-    if (taskId && taskQueue.isTaskInQueue(taskId)) {
-      taskQueue.completeTask(taskId, success);
-    }
   };
   try {
-    if (taskId && !taskQueue.isTaskInQueue(taskId)) {
-      addLog(`[Pregen] \u4EFB\u52A1\u5DF2\u88AB\u7528\u6237\u53D6\u6D88\uFF0C\u8DF3\u8FC7\u6267\u884C: ${normPrompt}`);
-      onTaskFinish(false);
-      return;
-    }
     const [imageUrl] = await getItemImg(normPrompt);
     if (taskEpoch !== currentSessionEpoch) return;
     if (imageUrl) {
       registerAutoClickHandled(normPrompt);
       addLog(`[Pregen] \u672C\u5730/\u8FDC\u7AEF\u5DF2\u5B58\u5728\u8BE5\u56FE\u7247\uFF0C\u8DF3\u8FC7\u9884\u751F\u6210: ${normPrompt}`);
-      onTaskFinish(true);
+      onTaskFinish();
       return;
     }
     if (isGenerating(normPrompt)) {
       addLog(`[Pregen] \u56FE\u50CF\u6B63\u5728\u751F\u6210\u4E2D\uFF0C\u8DF3\u8FC7\u91CD\u590D\u6D3E\u53D1: ${normPrompt}`);
-      onTaskFinish(true);
+      onTaskFinish();
       return;
     }
-    if (taskId && !taskQueue.isTaskInQueue(taskId)) {
-      onTaskFinish(false);
-      return;
-    }
+    const requestId = generateStableId3(normPrompt);
     registerAutoClickHandled(normPrompt, requestId);
     startGenerating(normPrompt);
-    if (taskId) {
-      taskQueue.updateStatus(taskId, TaskStatus.RUNNING);
-    }
     let timeoutTimer = null;
     let isCompleted = false;
     const imageResponseHandler = (responseData) => {
@@ -112085,7 +112269,7 @@ async function dispatchPregenTask(normPrompt, taskId, requestId) {
       isCompleted = true;
       const { success, error, prompt: responsePrompt } = responseData;
       addLog(`[Pregen] \u6536\u5230\u751F\u6210\u54CD\u5E94 (ID: ${requestId}, \u72B6\u6001: ${success ? "\u6210\u529F" : "\u5931\u8D25"}${error ? ", \u9519\u8BEF: " + error : ""})`);
-      onTaskFinish(Boolean(success));
+      onTaskFinish();
     };
     cleanup = () => {
       if (timeoutTimer) {
@@ -112096,14 +112280,11 @@ async function dispatchPregenTask(normPrompt, taskId, requestId) {
       stopGenerating(normPrompt);
     };
     activeTaskCleanups.add(cleanup);
-    if (taskId) {
-      taskIdToCleanup.set(taskId, cleanup);
-    }
     timeoutTimer = setTimeout(() => {
       if (isCompleted) return;
       isCompleted = true;
       addLog(`[Pregen] \u4EFB\u52A1\u8D85\u65F6\u672A\u54CD\u5E94 (ID: ${requestId})\uFF0C\u5DF2\u81EA\u52A8\u89E3\u9664\u72B6\u6001`);
-      onTaskFinish(false);
+      onTaskFinish();
     }, 18e4);
     eventSource46.on(EventType.GENERATE_IMAGE_RESPONSE, imageResponseHandler);
     let finalWidth = null;
@@ -112124,11 +112305,11 @@ async function dispatchPregenTask(normPrompt, taskId, requestId) {
     addLog(`[Pregen] \u5DF2\u5E76\u53D1\u6D3E\u53D1\u751F\u56FE\u8BF7\u6C42 (ID: ${requestId}): ${normPrompt}`);
   } catch (err) {
     console.error(`[Pregen] \u6D3E\u53D1\u9884\u751F\u6210\u4EFB\u52A1\u5F02\u5E38: ${normPrompt}`, err);
-    onTaskFinish(false);
+    onTaskFinish();
   }
 }
-function schedulePregenTask(normPrompt, taskId, requestId) {
-  dispatchPregenTask(normPrompt, taskId, requestId);
+function schedulePregenTask(normPrompt) {
+  dispatchPregenTask(normPrompt);
 }
 function add(prompts) {
   if (!Array.isArray(prompts)) return;
@@ -112137,25 +112318,26 @@ function add(prompts) {
     if (!norm) return;
     if (pregenDispatched.has(norm)) return;
     pregenDispatched.add(norm);
-    const requestId = generateStableId3(norm);
-    const taskId = taskQueue.addTask({
-      id: requestId,
-      name: norm.substring(0, 30) + (norm.length > 30 ? "..." : ""),
-      type: TaskType.PREGEN,
-      prompt: norm,
-      status: TaskStatus.QUEUED
-    });
-    promptToTaskId.set(norm, taskId);
-    schedulePregenTask(norm, taskId, requestId);
+    schedulePregenTask(norm);
   });
 }
 function clear() {
-  cancelAllPregenTasks();
+  currentSessionEpoch++;
+  pregenDispatched.clear();
+  for (const cleanup of activeTaskCleanups) {
+    try {
+      cleanup();
+    } catch (e) {
+      console.error("[Pregen] \u6E05\u7406\u5728\u9014\u4EFB\u52A1\u5931\u8D25:", e);
+    }
+  }
+  activeTaskCleanups.clear();
+  clearAllGenerating();
+  addLog(`[Pregen] \u9884\u751F\u6210\u72B6\u6001\u5DF2\u5B8C\u5168\u91CD\u7F6E (epoch: ${currentSessionEpoch})\uFF0C\u9632\u91CD\u8868\u5DF2\u6E05\u7A7A\u3002`);
 }
 var pregenManager = {
   add,
-  clear,
-  cancelAll: cancelAllPregenTasks
+  clear
 };
 
 // utils/settings/stream_generate.js
@@ -112197,6 +112379,11 @@ eventSource47.on(genStartedEvent, () => {
 });
 var genStoppedEvent = event_types7.GENERATION_STOPPED || "generation_stopped";
 eventSource47.on(genStoppedEvent, () => {
+  if (String(extension_settings115[extensionName]?.enablePregen) !== "true") return;
+  pregenManager.clear();
+});
+var genEndedEvent = event_types7.GENERATION_ENDED || "generation_ended";
+eventSource47.on(genEndedEvent, () => {
   if (String(extension_settings115[extensionName]?.enablePregen) !== "true") return;
   pregenManager.clear();
 });
