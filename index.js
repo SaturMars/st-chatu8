@@ -2479,6 +2479,7 @@ var init_config = __esm({
       sdUrl: "http://localhost:7860",
       st_chatu8_sd_auth: "",
       comfyuiUrl: "http://localhost:8188",
+      comfyui_token: "",
       comfyui_max_concurrency: 10,
       comfyui_timeout: 1800,
       // RunningHub 配置
@@ -3196,6 +3197,7 @@ var init_config = __esm({
           editWorker: "",
           // ComfyUI 设置
           comfyuiUrl: "http://localhost:8188",
+          comfyui_token: "",
           // 其他设置
           MODEL_NAME: "\u8FDE\u63A5\u540E\u9009\u62E9",
           comfyuisamplerName: "\u8FDE\u63A5\u540E\u9009\u62E9",
@@ -40698,6 +40700,7 @@ async function uploadToComfyUI(blob, filename, comfyuiUrl) {
   formData.append("image", blob, filename);
   const response = await fetch(`${comfyuiUrl}/upload/image`, {
     method: "POST",
+    headers: getComfyUIHeaders(),
     body: formData
   });
   if (!response.ok) {
@@ -46976,6 +46979,7 @@ async function detectMultiGpu(rawUrl) {
     const timer = setTimeout(() => controller.abort(), 1500);
     const res = await fetch(`${url}/mgpu/status`, {
       method: "GET",
+      headers: getComfyUIHeaders(),
       signal: controller.signal
     });
     clearTimeout(timer);
@@ -46992,6 +46996,7 @@ async function detectMultiGpu(rawUrl) {
 }
 async function fetchHistory(rawUrl, promptId, options = {}) {
   const url = normalizeUrl(rawUrl);
+  options = { headers: getComfyUIHeaders(), ...options };
   let isMulti = multiGpuCache.get(url);
   if (isMulti === void 0) {
     isMulti = await detectMultiGpu(url);
@@ -47014,7 +47019,7 @@ async function interruptAll(rawUrl, options = {}) {
   const url = normalizeUrl(rawUrl);
   if (!url) return;
   const isMulti = multiGpuCache.get(url);
-  const headers = options.headers || {};
+  const headers = options.headers || getComfyUIHeaders();
   const requests = [
     fetch(`${url}/api/interrupt`, {
       method: "POST",
@@ -47051,7 +47056,26 @@ function getComfyUIHeaders(contentType = null) {
   if (contentType) {
     headers["Content-Type"] = contentType;
   }
+  const token = (extension_settings49[extensionName]?.comfyui_token || "").trim();
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
   return headers;
+}
+async function hydrateComfyuiMediaPreviews() {
+  const token = (extension_settings49[extensionName]?.comfyui_token || "").trim();
+  if (!token) return;
+  const nodes = document.querySelectorAll('img[id^="comfyui_preview_"][src*="/view?"], audio[id^="comfyui_preview_"][src*="/view?"]');
+  for (const node of nodes) {
+    try {
+      const res = await fetch(node.src, { headers: getComfyUIHeaders() });
+      if (!res.ok) continue;
+      const blob = await res.blob();
+      node.src = URL.createObjectURL(blob);
+    } catch (e) {
+      console.warn("[ComfyUI] \u9884\u89C8\u52A0\u8F7D\u5931\u8D25:", e);
+    }
+  }
 }
 function stringifyJsonString(value) {
   return JSON.stringify(value == null ? "" : String(value));
@@ -50959,7 +50983,7 @@ async function abortComfyUIVideoTask(taskId) {
   if (taskCtx.promptId && taskCtx.url) {
     fetch(`${taskCtx.url}/queue`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: getComfyUIHeaders("application/json"),
       body: JSON.stringify({ delete: [taskCtx.promptId] })
     }).catch(() => {
     });
@@ -51255,6 +51279,7 @@ async function uploadBlankPngToComfyUIWithCache(comfyuiUrl) {
   formData.append("overwrite", "true");
   const res = await fetch(`${comfyuiUrl}/upload/image`, {
     method: "POST",
+    headers: getComfyUIHeaders(),
     body: formData
   });
   if (!res.ok) {
@@ -51321,6 +51346,7 @@ async function uploadBlankAudioToComfyUIWithCache(comfyuiUrl) {
   formData.append("overwrite", "true");
   const res = await fetch(`${comfyuiUrl}/upload/image`, {
     method: "POST",
+    headers: getComfyUIHeaders(),
     body: formData
   });
   if (!res.ok) {
@@ -51364,6 +51390,7 @@ async function uploadImageBlobToComfyUIWithCache(imageSource, cacheKey, comfyuiU
   formData.append("overwrite", "true");
   const res = await fetch(`${comfyuiUrl}/upload/image`, {
     method: "POST",
+    headers: getComfyUIHeaders(),
     body: formData
   });
   if (!res.ok) {
@@ -51442,6 +51469,7 @@ async function uploadMediaToComfyUIWithCache(fileId, kind, comfyuiUrl) {
   formData.append("overwrite", "true");
   const res = await fetch(`${comfyuiUrl}/upload/image`, {
     method: "POST",
+    headers: getComfyUIHeaders(),
     body: formData
   });
   if (!res.ok) {
@@ -51685,7 +51713,7 @@ async function generateComfyUIRefVideo({ prompt: rawPrompt, width: Xwidth, heigh
     addLog(`[ComfyUIVideo] \u6B63\u5728\u5411 ComfyUI \u63D0\u4EA4\u4EFB\u52A1...`);
     const submitRes = await fetch(`${url}/prompt`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: getComfyUIHeaders("application/json"),
       body: promptPayload,
       signal: abortController.signal
     });
@@ -51786,7 +51814,7 @@ async function generateComfyUIRefVideo({ prompt: rawPrompt, width: Xwidth, heigh
         if (foundFile) {
           addLog(`[ComfyUIVideo] \u4EFB\u52A1\u5B8C\u6210\uFF0C\u6B63\u5728\u83B7\u53D6\u751F\u6210\u6587\u4EF6: ${foundFile.filename}...`);
           outputUrl = `${url}/view?filename=${encodeURIComponent(foundFile.filename)}&subfolder=${encodeURIComponent(foundFile.subfolder)}&type=output`;
-          const viewRes = await fetch(outputUrl, { signal: abortController.signal });
+          const viewRes = await fetch(outputUrl, { headers: getComfyUIHeaders(), signal: abortController.signal });
           if (!viewRes.ok) {
             throw new Error(`\u83B7\u53D6\u6587\u4EF6\u5931\u8D25: ${viewRes.status}`);
           }
@@ -51903,7 +51931,7 @@ async function executeComfyUIVideoDirectTest({
   const promptPayload = JSON.stringify({ client_id: clientId, prompt: promptObj });
   const submitRes = await fetch(`${url}/prompt`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: getComfyUIHeaders("application/json"),
     body: promptPayload,
     signal: abortSignal
   });
@@ -52017,7 +52045,7 @@ async function executeComfyUIVideoDirectTest({
         foundFileName = foundFile.filename;
         notify(`\u751F\u6210\u5B8C\u6210\uFF0C\u6B63\u5728\u62C9\u53D6\u89C6\u9891\u6587\u4EF6: ${foundFile.filename}...`);
         outputUrl = `${url}/view?filename=${encodeURIComponent(foundFile.filename)}&subfolder=${encodeURIComponent(foundFile.subfolder)}&type=output`;
-        const viewRes = await fetch(outputUrl, { signal: abortSignal });
+        const viewRes = await fetch(outputUrl, { headers: getComfyUIHeaders(), signal: abortSignal });
         if (!viewRes.ok) {
           throw new Error(`\u83B7\u53D6\u6587\u4EF6\u5931\u8D25: ${viewRes.status}`);
         }
@@ -89061,6 +89089,7 @@ async function handleImageUpload22(event) {
     }
     const response = await fetch(`${url111}/upload/image`, {
       method: "POST",
+      headers: getComfyUIHeaders(),
       body: formData
     });
     if (response.ok) {
@@ -89213,7 +89242,7 @@ function pingDirect() {
   const timeoutId = setTimeout(() => controller.abort(), PING_TIMEOUT);
   fetch(`${comfyUrl}/system_stats`, {
     method: "GET",
-    headers: { "Content-Type": "application/json" },
+    headers: getComfyUIHeaders("application/json"),
     signal: controller.signal
   }).then((res) => {
     if (!res.ok) {
@@ -89322,7 +89351,7 @@ async function testComfyui() {
       await saveFullComfyuiCache(cacheData);
       window.dispatchEvent(new CustomEvent("comfyui-cache-updated", { detail: cacheData }));
     } else {
-      const response = await fetch(testurl);
+      const response = await fetch(testurl, { headers: getComfyUIHeaders() });
       if (response.ok) {
         alert("\u8FDE\u63A5\u6210\u529F");
         const responseData = await response.json();
@@ -98018,6 +98047,7 @@ async function uploadComfyUIImageDirect(imageBlob, fileName) {
   formData.append("overwrite", "true");
   const res = await fetch(`${url}/upload/image`, {
     method: "POST",
+    headers: getComfyUIHeaders(),
     body: formData
   });
   if (!res.ok) {
@@ -98540,6 +98570,7 @@ function initComfyUIVideoUI() {
         toastr.info(`\u5DF2\u6E05\u9664\u56FE\u7247 ${i}`);
       });
     }
+    hydrateComfyuiMediaPreviews();
   }
   renderComfyUIImageCards();
   function renderComfyUIAudioCards() {
@@ -98737,6 +98768,7 @@ function initComfyUIVideoUI() {
         toastr.info(`\u5DF2\u6E05\u9664\u97F3\u9891 ${i}`);
       });
     }
+    hydrateComfyuiMediaPreviews();
   }
   renderComfyUIAudioCards();
   const testDemandEl = document.getElementById("comfyui_video_test_demand");
@@ -108417,6 +108449,7 @@ var COMFYUI_PROFILE_KEYS = [
   "editWorker",
   // ComfyUI 设置
   "comfyuiUrl",
+  "comfyui_token",
   // 其他设置
   "MODEL_NAME",
   "comfyuisamplerName",
@@ -110846,7 +110879,7 @@ async function initUI({ check_update: check_update2 }) {
       settings2.theme_id = "\u9ED8\u8BA4-\u767D\u5929";
     }
     applyTheme(settings2.themes[settings2.theme_id]);
-    const mainKeys = ["scriptEnabled", "helpTipsEnabled", "disablePluginToast", "newlineFixEnabled", "mode", "client", "displayMode", "heavyFrontendMode", "insertOriginalText", "dbclike", "collapseImage", "zidongdianji", "zidongdianji2", "longPressToEdit", "clickToPreview", "startTag", "endTag", "cache", "sdUrl", "st_chatu8_sd_auth", "comfyuiUrl", "comfyui_max_concurrency", "comfyui_timeout", "novelaiApi", "novelaisite", "novelaiOtherSite", "enableCloudQueue", "cloudQueueUrl", "cloudQueueGreeting", "showQueueGreeting", "novelaimode", "novelai_sampler", "Schedule", "nai3Scale", "cfg_rescale", "AI_use_coords", "sm", "dyn", "nai3Variety", "nai3Deceisp", "sd_cwidth", "sd_cheight", "sd_csteps", "sd_cseed", "sdCfgScale", "restoreFaces", "novelai_width", "novelai_height", "novelai_steps", "novelai_seed", "nai3VibeTransfer", "enableVibeGroupTransfer", "randomVibeGroup", "normalizeRefStrength", "InformationExtracted", "ReferenceStrength", "nai3CharRef", "nai3StylePerception", "comfyui_width", "comfyui_height", "comfyui_steps", "comfyui_seed", "cfg_comfyui", "worker", "ipa", "c_fenwei", "c_xijie", "c_quanzhong", "c_idquanzhong", "AQT_sd", "UCP_sd", "AQT_novelai", "UCP_novelai", "AQT_comfyui", "UCP_comfyui", "addFurryDataset", "sd_cupscale_factor", "sd_chires_fix", "sd_chires_steps", "sd_cdenoising_strength", "sd_cclip_skip", "sd_cadetailer", "worldBookEnabled", "ai_temperature", "ai_top_p", "ai_presence_penalty", "ai_frequency_penalty", "ai_stream", "ai_private", "ai_token", "vocabulary_search_startswith", "vocabulary_search_limit", "vocabulary_search_sort", "enablePregen", "autoLLMImageGen", "randomYushe", "aiAutonomousResolution", "videoChannel", "imageAlignment", "imageSizeScale", "imageGenInterval", "translation_system_prompt", "ai_test_system", "ai_test_user", "ai_test_output", "jiuguanchucun", "vibeJiuguanchucun", "convertToJpegStorage", "weilin_lora_fix"];
+    const mainKeys = ["scriptEnabled", "helpTipsEnabled", "disablePluginToast", "newlineFixEnabled", "mode", "client", "displayMode", "heavyFrontendMode", "insertOriginalText", "dbclike", "collapseImage", "zidongdianji", "zidongdianji2", "longPressToEdit", "clickToPreview", "startTag", "endTag", "cache", "sdUrl", "st_chatu8_sd_auth", "comfyuiUrl", "comfyui_token", "comfyui_max_concurrency", "comfyui_timeout", "novelaiApi", "novelaisite", "novelaiOtherSite", "enableCloudQueue", "cloudQueueUrl", "cloudQueueGreeting", "showQueueGreeting", "novelaimode", "novelai_sampler", "Schedule", "nai3Scale", "cfg_rescale", "AI_use_coords", "sm", "dyn", "nai3Variety", "nai3Deceisp", "sd_cwidth", "sd_cheight", "sd_csteps", "sd_cseed", "sdCfgScale", "restoreFaces", "novelai_width", "novelai_height", "novelai_steps", "novelai_seed", "nai3VibeTransfer", "enableVibeGroupTransfer", "randomVibeGroup", "normalizeRefStrength", "InformationExtracted", "ReferenceStrength", "nai3CharRef", "nai3StylePerception", "comfyui_width", "comfyui_height", "comfyui_steps", "comfyui_seed", "cfg_comfyui", "worker", "ipa", "c_fenwei", "c_xijie", "c_quanzhong", "c_idquanzhong", "AQT_sd", "UCP_sd", "AQT_novelai", "UCP_novelai", "AQT_comfyui", "UCP_comfyui", "addFurryDataset", "sd_cupscale_factor", "sd_chires_fix", "sd_chires_steps", "sd_cdenoising_strength", "sd_cclip_skip", "sd_cadetailer", "worldBookEnabled", "ai_temperature", "ai_top_p", "ai_presence_penalty", "ai_frequency_penalty", "ai_stream", "ai_private", "ai_token", "vocabulary_search_startswith", "vocabulary_search_limit", "vocabulary_search_sort", "enablePregen", "autoLLMImageGen", "randomYushe", "aiAutonomousResolution", "videoChannel", "imageAlignment", "imageSizeScale", "imageGenInterval", "translation_system_prompt", "ai_test_system", "ai_test_user", "ai_test_output", "jiuguanchucun", "vibeJiuguanchucun", "convertToJpegStorage", "weilin_lora_fix"];
     mainKeys.forEach((key) => {
       const element = document.getElementById(key);
       if (element) {
