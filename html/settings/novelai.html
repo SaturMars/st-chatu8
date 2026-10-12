@@ -227,9 +227,29 @@
                     </button>
                 </div>
             </div>
+            <div class="st-chatu8-field" id="novelai_v5_effort_container" style="display: none;">
+                <label for="novelai_v5_effort">
+                    质量/算力档位 (Effort)
+                    <small style="display: block; font-size: 0.82em; color: var(--st-chatu8-text-secondary, #aaa); margin-top: 2px;">
+                        仅 V5 Full 支持：Medium 模式省约 42% 算力且画质相近
+                    </small>
+                </label>
+                <div style="display: flex; gap: 8px; width: 100%; max-width: 420px;">
+                    <button type="button" class="st-chatu8-btn st-chatu8-effort-btn" data-effort="high" id="st_chatu8_effort_high" style="flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px;">
+                        <i class="fa-solid fa-gem"></i> High (高质量·23步)
+                    </button>
+                    <button type="button" class="st-chatu8-btn st-chatu8-effort-btn" data-effort="medium" id="st_chatu8_effort_medium" style="flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px;">
+                        <i class="fa-solid fa-bolt"></i> Medium (省流·14步)
+                    </button>
+                    <input type="hidden" id="novelai_v5_effort" value="high" />
+                </div>
+            </div>
             <div class="st-chatu8-field" id="novelai_straight_alpha_container" style="display: none;">
                 <label for="novelai_straight_alpha">透明图片开关 (straight_alpha)</label>
-                <input type="checkbox" id="novelai_straight_alpha" class="st-chatu8-checkbox" />
+                <div class="st-chatu8-toggle">
+                    <input type="checkbox" id="novelai_straight_alpha" />
+                    <span class="st-chatu8-slider"></span>
+                </div>
             </div>
             <div class="st-chatu8-field">
                 <label for="novelai_sampler">采样方法</label>

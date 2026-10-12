@@ -243,6 +243,14 @@
     background-color: var(--st-chatu8-danger-secondary);
 }
 
+#st-chatu8-settings .st-chatu8-effort-btn.active {
+    background-color: var(--st-chatu8-accent-primary, #4a90e2);
+    border-color: var(--st-chatu8-accent-secondary, #357abd);
+    color: var(--st-chatu8-text-highlight, white);
+    font-weight: bold;
+    box-shadow: 0 0 6px rgba(74, 144, 226, 0.4);
+}
+
 #st-chatu8-settings .st-chatu8-icon-btn {
     padding: 10px;
     line-height: 1;
@@ -306,8 +314,6 @@
 #st-chatu8-settings .st-chatu8-select option {
     background-color: var(--st-chatu8-dropdown-list-bg, var(--st-chatu8-bg-secondary));
     color: var(--st-chatu8-dropdown-text, var(--st-chatu8-text-primary));
-    padding: 10px 12px;
-    /* May not be applied consistently */
 }
 
 

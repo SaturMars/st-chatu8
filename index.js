@@ -2736,6 +2736,7 @@ var init_config = __esm({
       editWorker: editwk,
       novelaimode: "nai-diffusion-4-5-full",
       novelai_straight_alpha: false,
+      novelai_v5_effort: "high",
       novelaisite: "\u5B98\u7F51",
       novelaiOtherSite: "http://localhost:9696/get-new-token",
       enableCloudQueue: "false",
@@ -10275,9 +10276,10 @@ var init_utils = __esm({
        * @param {number} [intervalMs=0] 生图间隔时间（毫秒）
        */
       release(taskId, intervalMs = 0) {
-        if (this.activeTaskId === taskId) {
-          this.activeTaskId = null;
+        if (this.activeTaskId !== taskId) {
+          return;
         }
+        this.activeTaskId = null;
         const safeInterval = Math.max(0, parseInt(intervalMs, 10) || 0);
         if (this.coolingTimer) {
           clearTimeout(this.coolingTimer);
@@ -16282,6 +16284,11 @@ function removeThinkingText(text) {
   if (result !== beforeCommentRemoval) {
     console.log("[imageInserter] Removed HTML comments, length:", beforeCommentRemoval.length, "-> new length:", result.length);
   }
+  const beforeContentRemoval = result;
+  result = result.replace(/^[\s\S]*?<content>\s*/i, "");
+  if (result !== beforeContentRemoval) {
+    console.log("[imageInserter] Removed text before <content>, length:", beforeContentRemoval.length, "-> new length:", result.length);
+  }
   const beforeOuterRemoval = result;
   result = result.replace(
     /(?:<font[^>]*>\[[^\]]*\]<\/font>\s*)?(?:<Tag_think>[\s\S]*?<\/Tag_think>\s*)?<image>[\s\S]*?<\/image>/g,
@@ -16316,6 +16323,11 @@ function removeThinkingTextOnly(text) {
   result = result.replace(/<!--[\s\S]*?-->/g, "");
   if (result !== beforeCommentRemoval) {
     console.log("[imageInserter] Removed HTML comments, length:", beforeCommentRemoval.length, "-> new length:", result.length);
+  }
+  const beforeContentRemoval = result;
+  result = result.replace(/^[\s\S]*?<content>\s*/i, "");
+  if (result !== beforeContentRemoval) {
+    console.log("[imageInserter] Removed text before <content> only, length:", beforeContentRemoval.length, "-> new length:", result.length);
   }
   return result;
 }
@@ -16985,7 +16997,13 @@ async function insertImagesIntoElement(rootElement, images) {
     if (matchResult) {
       let correctEndIndex = matchResult.endIndex;
       const matchedLine = matchResult.matchedLine;
-      const searchStartOffset = Math.max(thinkingEndOffsetDOM, firstDivEndOffset > 0 ? firstDivEndOffset : 0);
+      let baseOffsetDOM = thinkingEndOffsetDOM;
+      const textAfterThinkingDOM = logicalText.substring(thinkingEndOffsetDOM);
+      const contentMatchDOM = textAfterThinkingDOM.match(/^[\s\S]*?<content>\s*/i);
+      if (contentMatchDOM) {
+        baseOffsetDOM = thinkingEndOffsetDOM + contentMatchDOM[0].length;
+      }
+      const searchStartOffset = Math.max(baseOffsetDOM, firstDivEndOffset > 0 ? firstDivEndOffset : 0);
       let lineIndexInOriginal = logicalText.indexOf(matchedLine, searchStartOffset);
       if (lineIndexInOriginal === -1) {
         lineIndexInOriginal = logicalText.indexOf(matchedLine);
@@ -17408,16 +17426,23 @@ async function saveImageGroup(images, logicalText, el) {
             }
             console.log("[imageInserter] insertOriginalText: thinkingEndOffset =", thinkingEndOffset);
           }
+          let searchStartOffset = thinkingEndOffset;
+          const textAfterThinking = mes.substring(thinkingEndOffset);
+          const contentMatch = textAfterThinking.match(/^[\s\S]*?<content>\s*/i);
+          if (contentMatch) {
+            searchStartOffset = thinkingEndOffset + contentMatch[0].length;
+            console.log("[imageInserter] insertOriginalText: searchStartOffset (with <content>) =", searchStartOffset);
+          }
           const matchResults = [];
           for (const img of allImages) {
             const matchResult = fuzzyMatchLine(mesForMatch, img.regex, 0.5);
             if (matchResult) {
               let correctEndIndex = matchResult.endIndex;
               const matchedLine = matchResult.matchedLine;
-              const lineIndexInOriginal = mes.indexOf(matchedLine, thinkingEndOffset);
+              const lineIndexInOriginal = mes.indexOf(matchedLine, searchStartOffset);
               if (lineIndexInOriginal !== -1) {
                 correctEndIndex = lineIndexInOriginal + matchedLine.length;
-                console.log(`[imageInserter] insertOriginalText: Remapped endIndex: ${matchResult.endIndex} -> ${correctEndIndex} (searchFrom: ${thinkingEndOffset})`);
+                console.log(`[imageInserter] insertOriginalText: Remapped endIndex: ${matchResult.endIndex} -> ${correctEndIndex} (searchFrom: ${searchStartOffset})`);
               } else {
                 const fallbackIndex = mes.indexOf(matchedLine);
                 if (fallbackIndex !== -1) {
@@ -27824,7 +27849,7 @@ function getNovelAIQualityPresetsText(settings3) {
     aqt = "very aesthetic, masterpiece, no text";
   } else if (settings3.AQT_novelai != "" && settings3.novelaimode == "nai-diffusion-4-5-curated") {
     aqt = "very aesthetic, masterpiece, no text, -0.8::feet::, rating:general";
-  } else if (settings3.AQT_novelai != "" && settings3.novelaimode == "nai-diffusion-5-full") {
+  } else if (settings3.AQT_novelai != "" && String(settings3.novelaimode || "").includes("nai-diffusion-5-full")) {
     aqt = "very aesthetic, amazing quality, no text";
   } else if (settings3.AQT_novelai != "" && settings3.novelaimode == "nai-diffusion-5-curated") {
     aqt = "very aesthetic, masterpiece, no text";
@@ -38893,11 +38918,11 @@ function showUserDemandPopup2(options = {}) {
     setTimeout(() => textarea.focus(), 100);
   });
 }
-async function handlePromptRequest(el, gestureId) {
-  return processImageLikeRequest(el, gestureId, "image_gen", "\u6B63\u6587\u56FE\u7247\u751F\u6210", LLM_IMAGE_GEN);
+async function handlePromptRequest(el, gestureId, options = {}) {
+  return processImageLikeRequest(el, gestureId, "image_gen", "\u6B63\u6587\u56FE\u7247\u751F\u6210", LLM_IMAGE_GEN, options);
 }
-async function handleVisualMatPrepRequest(el, gestureId) {
-  return processImageLikeRequest(el, gestureId, "visual_mat_prep", "\u89C6\u6750\u51C6\u5907", LLM_VISUAL_MAT_PREP);
+async function handleVisualMatPrepRequest(el, gestureId, options = {}) {
+  return processImageLikeRequest(el, gestureId, "visual_mat_prep", "\u89C6\u6750\u51C6\u5907", LLM_VISUAL_MAT_PREP, options);
 }
 function extractVideosXmlContent(text) {
   if (!text || typeof text !== "string") return "";
@@ -39233,13 +39258,14 @@ async function handleImageToVideoGen(targetEl, imgElement, button, dialogContext
     toastr.error("\u56FE\u751F\u89C6\u9891\u8BF7\u6C42\u5931\u8D25: " + (err.message || err));
   }
 }
-async function processImageLikeRequest(el, gestureId, requestType, title, llmFunction) {
+async function processImageLikeRequest(el, gestureId, requestType, title, llmFunction, options = {}) {
   const mainTimer = debugTimer(`promptReq.${requestType}`, `${title}\u6838\u5FC3\u6D41\u7A0B`);
   debugMilestone(requestType, `\u5F00\u59CB\u5904\u7406${title}\u8BF7\u6C42`);
   debugLog(`promptReq.${requestType}`, "\u8BF7\u6C42\u521D\u59CB\u5316", {
     gestureId,
     \u76EE\u6807\u5143\u7D20: el?.className || el?.tagName,
-    \u529F\u80FD\u8BF4\u660E: `\u5904\u7406\u624B\u52BF\u8BC6\u522B\u540E\u7684${title}\u8BF7\u6C42`
+    \u529F\u80FD\u8BF4\u660E: `\u5904\u7406\u624B\u52BF\u8BC6\u522B\u540E\u7684${title}\u8BF7\u6C42`,
+    \u89E6\u53D1\u6765\u6E90: options?.source || "manual"
   });
   let isDemandEnabled = false;
   let defaultDemand = "";
@@ -39259,6 +39285,14 @@ async function processImageLikeRequest(el, gestureId, requestType, title, llmFun
   } else {
     isDemandEnabled = extension_settings40[extensionName]?.imageGenDemandEnabled ?? false;
     defaultDemand = extension_settings40[extensionName]?.defaultImageDemand || "";
+  }
+  const isAutoTrigger = options?.source === "auto" || options?.isAuto === true || options?.skipDemandPopup === true;
+  if (isAutoTrigger) {
+    debugBranch(requestType, "\u81EA\u52A8\u89E6\u53D1\uFF0C\u8DF3\u8FC7\u7528\u6237\u9700\u6C42\u5F39\u7A97", true, {
+      source: options?.source || "auto",
+      skipDemandPopup: options?.skipDemandPopup
+    });
+    isDemandEnabled = false;
   }
   let userDemand = "";
   let userUploadedImages = [];
@@ -61520,7 +61554,13 @@ function loadEdgePingFromSettings() {
   if (!extension_settings98[extensionName]) return false;
   const cache = extension_settings98[extensionName].edgePingCache;
   if (!cache || !cache.servers || !cache.pingTime) return false;
-  availableEdgeServers = cache.servers.map((s) => ({ name: s.name, url: s.url, latency: s.latency }));
+  const validUrls = new Set(EDGE_TTS_CONFIG.proxyServers.map((s) => s.url));
+  const validServers = cache.servers.filter((s) => validUrls.has(s.url));
+  if (validServers.length === 0) {
+    log("\u{1F4C2} \u7F13\u5B58\u7684 Edge \u670D\u52A1\u5668\u5DF2\u4E0D\u5728\u5F53\u524D\u914D\u7F6E\u5217\u8868\u4E2D\uFF0C\u5C06\u91CD\u65B0\u68C0\u6D4B\u65B0\u8282\u70B9");
+    return false;
+  }
+  availableEdgeServers = validServers.map((s) => ({ name: s.name, url: s.url, latency: s.latency }));
   edgeServerIndex = 0;
   lastEdgePingResult = cache.pingResult;
   lastEdgePingTime = cache.pingTime;
@@ -62399,13 +62439,8 @@ var init_tts = __esm({
     currentEngine = "qwen";
     EDGE_TTS_CONFIG = {
       proxyServers: [
-        { name: "\u4E2D\u56FD", url: "http://t.leftsite.cn/tts" },
-        { name: "\u4E2D\u56FD\u5317\u4EAC", url: "http://60.205.243.148:8080/tts" },
-        { name: "\u65B0\u52A0\u5761", url: "http://5.45.99.149:8075/tts" },
-        { name: "\u7532\u9AA8\u6587\u9996\u5C14", url: "http://193.122.107.44:9090/tts" },
-        { name: "\u7F8E\u56FD\u65E7\u91D1\u5C71", url: "http://104.214.168.83:8080/tts" },
-        { name: "\u7F8E\u56FD\u7EBD\u7EA6", url: "http://74.48.40.244:8010/tts" },
-        { name: "\u963F\u91CC\u4E91\u4E1C\u5357\u4E9A", url: "http://47.79.92.215:18080/tts" }
+        { name: "Cloudflare\u4E13\u5C5E", url: "https://edge.damoshen123.workers.dev/tts" },
+        { name: "\u65B0\u52A0\u5761\u5907\u7528", url: "http://5.45.99.149:8075/tts" }
       ],
       voice: "zh-CN-XiaoxiaoNeural",
       style: "general",
@@ -64407,8 +64442,12 @@ var init_novelaiSettingsModule = __esm({
 \u25A0 \u6A21\u578B\u4E0E\u91C7\u6837\u5668\u914D\u7F6E
 
 \u8BBE\u7F6E\u6A21\u578B\uFF1A
-<SystemQuery>{"type": "write", "path": "novelaimode", "value": "nai-diffusion-4-5-curated"}</SystemQuery>
-\u53EF\u9009\u503C\uFF1Anai-diffusion-3 / nai-diffusion-4-full / nai-diffusion-4-curated-preview / nai-diffusion-4-5-curated / nai-diffusion-4-5-full
+<SystemQuery>{"type": "write", "path": "novelaimode", "value": "nai-diffusion-5-full"}</SystemQuery>
+\u53EF\u9009\u503C\uFF1Anai-diffusion-3 / nai-diffusion-4-full / nai-diffusion-4-curated-preview / nai-diffusion-4-5-curated / nai-diffusion-4-5-full / nai-diffusion-5-curated / nai-diffusion-5-full
+
+\u8BBE\u7F6E V5 Full \u8D28\u91CF\u4E0E\u7B97\u529B\u6863\u4F4D\uFF08Effort\uFF09\uFF1A
+<SystemQuery>{"type": "write", "path": "novelai_v5_effort", "value": "high"}</SystemQuery>
+\u53EF\u9009\u503C\uFF1Ahigh\uFF08\u9AD8\u8D28\u91CF\xB723\u6B65\u539F\u7248\uFF09/ medium\uFF08\u7701\u6D41\xB714\u6B65\u84B8\u998F\u7248\uFF0C\u7701\u7EA642%\u7B97\u529B\uFF09
 
 \u8BBE\u7F6E\u91C7\u6837\u65B9\u6CD5\uFF1A
 <SystemQuery>{"type": "write", "path": "novelai_sampler", "value": "k_euler"}</SystemQuery>
@@ -83533,6 +83572,11 @@ var workingNovelAIUrlCache = /* @__PURE__ */ new Map();
 function clearNovelAIUrlCache() {
   workingNovelAIUrlCache.clear();
 }
+function evictNovelAIUrlCache(rawOtherSite, endpointPath = "/ai/generate-image") {
+  if (!rawOtherSite) return;
+  const normalizedPath = endpointPath.startsWith("/") ? endpointPath : `/${endpointPath}`;
+  workingNovelAIUrlCache.delete(`${rawOtherSite}|${normalizedPath}`);
+}
 function getNovelAICandidateUrls(endpointPath = "/ai/generate-image") {
   const settings3 = extension_settings62[extensionName];
   if (settings3.novelaisite === "\u5B98\u7F51") {
@@ -83620,10 +83664,12 @@ async function postNovelAIWithFallback({
       }
     }
     if (response && response.ok) {
-      if (rawOtherSite) {
-        const normalizedPath = endpointPath.startsWith("/") ? endpointPath : `/${endpointPath}`;
-        workingNovelAIUrlCache.set(`${rawOtherSite}|${normalizedPath}`, currentUrl);
+      const contentType = (response.headers.get("content-type") || "").toLowerCase();
+      if (contentType.includes("text/html") && !isLast) {
+        addLog(`${logPrefix} \u7AEF\u70B9 ${currentUrl} \u8FD4\u56DE\u4E86 HTML (HTTP 200)\uFF0C\u7591\u4F3C\u672A\u5339\u914D\u7684\u8DEF\u7531\u9875\u9762\uFF0C\u56DE\u9000\u5C1D\u8BD5\u5019\u9009\u7AEF\u70B9: ${nextUrl}`);
+        continue;
       }
+      response._verifiedCandidateUrl = currentUrl;
       return response;
     }
     if (response) {
@@ -83707,6 +83753,12 @@ function cleanNovelAIPayload(payload, modelVersion) {
     }
     if (cleanedPayload.sampler === "ddim_v3") {
       cleanedPayload.sampler = "k_euler_ancestral";
+    }
+    if (modelVersion.includes("medium")) {
+      delete cleanedPayload.cfg_rescale;
+      cleanedPayload.steps = 14;
+      cleanedPayload.sampler = "k_euler_ancestral";
+      addLog("[PayloadClean] \u5DF2\u9488\u5BF9 NAI5 Medium \u6863\u4F4D\u6E05\u7406 cfg_rescale \u5E76\u9501\u5B9A\u6B65\u6570 14\u3001\u91C7\u6837\u5668 Euler Ancestral");
     }
     addLog("[PayloadClean] \u5DF2\u9488\u5BF9 NAI5 \u6A21\u578B\u6E05\u7406\u7279\u5B9A\u4E0D\u652F\u6301\u7684\u53C2\u6570 (\u5305\u542B noise_schedule)");
   }
@@ -84083,6 +84135,13 @@ async function unzipFile(inputData) {
   if (!inputData) {
     throw new Error("\u89E3\u538B\u6570\u636E\u4E3A\u7A7A");
   }
+  const extractJsonError = (parsed, rawText) => {
+    const errMsg = parsed.message || parsed.error?.message || parsed.error || parsed.msg || parsed.detail;
+    if (errMsg) {
+      return `API\u8FD4\u56DE\u9519\u8BEF: ${typeof errMsg === "object" ? JSON.stringify(errMsg) : errMsg}`;
+    }
+    return `API\u54CD\u5E94\u4E3AJSON\u4F46\u672A\u5305\u542B\u6709\u6548\u56FE\u50CF\u6570\u636E: ${rawText.substring(0, 150)}`;
+  };
   if (typeof inputData === "string") {
     const trimmed = inputData.trim();
     if (trimmed.startsWith("data:image/")) {
@@ -84091,6 +84150,21 @@ async function unzipFile(inputData) {
     }
     if (trimmed.startsWith("iVBORw0KGgo")) {
       return trimmed;
+    }
+    if (trimmed.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (parsed.images && parsed.images[0]) return parsed.images[0];
+        if (parsed.image) return parsed.image;
+        throw new Error(extractJsonError(parsed, trimmed));
+      } catch (jsonErr) {
+        if (jsonErr.message.startsWith("API")) throw jsonErr;
+      }
+    }
+    if (trimmed.startsWith("<") && (trimmed.toLowerCase().includes("<!doctype") || trimmed.toLowerCase().includes("<html"))) {
+      const titleMatch = trimmed.match(/<title[^>]*>([^<]+)<\/title>/i);
+      const htmlHint = titleMatch ? ` (\u9875\u9762\u6807\u9898: ${titleMatch[1].trim()})` : "";
+      throw new Error(`\u7AEF\u70B9\u8FD4\u56DE\u4E86HTML\u9875\u9762\u800C\u975E\u56FE\u50CF\u538B\u7F29\u5305${htmlHint}\u3002\u8BF7\u68C0\u67E5API\u5730\u5740\u3001\u53CD\u4EE3\u8DEF\u7531\u914D\u7F6E\u6216\u662F\u5426\u88AB\u62E6\u622A\u3002`);
     }
   }
   let uint8Data = null;
@@ -84114,28 +84188,47 @@ async function unzipFile(inputData) {
     if (isZipBinary) {
       zipPayload = uint8Data;
     } else {
+      let text = "";
       try {
-        const text = new TextDecoder().decode(uint8Data).trim();
-        if (text.startsWith("UEsDB")) {
-          zipPayload = text;
-          loadOptions = { base64: true };
-        } else if (text.startsWith("iVBORw0KGgo") || text.startsWith("data:image/")) {
-          const commaIdx = text.indexOf(",");
-          return commaIdx !== -1 ? text.substring(commaIdx + 1) : text;
-        } else if (text.startsWith("{")) {
+        text = new TextDecoder().decode(uint8Data).trim();
+      } catch (_) {
+        text = "";
+      }
+      if (text.startsWith("UEsDB")) {
+        zipPayload = text;
+        loadOptions = { base64: true };
+      } else if (text.startsWith("iVBORw0KGgo") || text.startsWith("data:image/")) {
+        const commaIdx = text.indexOf(",");
+        return commaIdx !== -1 ? text.substring(commaIdx + 1) : text;
+      } else if (text.startsWith("{")) {
+        try {
           const parsed = JSON.parse(text);
           if (parsed.images && parsed.images[0]) return parsed.images[0];
           if (parsed.image) return parsed.image;
-        } else {
-          zipPayload = uint8Data;
+          throw new Error(extractJsonError(parsed, text));
+        } catch (parseErr) {
+          if (parseErr.message.startsWith("API")) throw parseErr;
+          throw new Error(`API\u8FD4\u56DE\u65E0\u6548JSON\u54CD\u5E94: ${text.substring(0, 150)}`);
         }
-      } catch (_) {
-        zipPayload = uint8Data;
+      } else if (text.startsWith("<") && (text.toLowerCase().includes("<!doctype") || text.toLowerCase().includes("<html"))) {
+        const titleMatch = text.match(/<title[^>]*>([^<]+)<\/title>/i);
+        const htmlHint = titleMatch ? ` (\u9875\u9762\u6807\u9898: ${titleMatch[1].trim()})` : "";
+        throw new Error(`\u7AEF\u70B9\u8FD4\u56DE\u4E86HTML\u9875\u9762\u800C\u975E\u56FE\u50CF\u538B\u7F29\u5305${htmlHint}\u3002\u8BF7\u68C0\u67E5API\u5730\u5740\u3001\u53CD\u4EE3\u8DEF\u7531\u914D\u7F6E\u6216\u662F\u5426\u88AB\u62E6\u622A\u3002`);
+      } else if (text.length > 0 && text.length < 500) {
+        throw new Error(`\u7AEF\u70B9\u8FD4\u56DE\u975E\u9884\u671F\u6587\u672C\u54CD\u5E94: ${text}`);
+      } else {
+        const magicBytes = Array.from(uint8Data.slice(0, 4)).map((b) => "0x" + b.toString(16).padStart(2, "0")).join(", ");
+        throw new Error(`\u8FD4\u56DE\u6570\u636E\u4E0D\u662F\u5408\u6CD5\u7684ZIP\u538B\u7F29\u5305\u6216\u56FE\u7247\u6587\u4EF6\uFF08\u524D\u5BFC\u5B57\u8282: [${magicBytes}]\uFF09`);
       }
     }
   } else if (typeof inputData === "string") {
-    zipPayload = inputData.trim();
-    loadOptions = { base64: true };
+    const trimmed = inputData.trim();
+    if (trimmed.startsWith("UEsDB")) {
+      zipPayload = trimmed;
+      loadOptions = { base64: true };
+    } else {
+      throw new Error(`\u8F93\u5165\u5B57\u7B26\u4E32\u4E0D\u662F\u5408\u6CD5\u7684 Base64 ZIP \u6570\u636E`);
+    }
   }
   try {
     const zip = await JSZipConstructor.loadAsync(zipPayload, loadOptions);
@@ -84660,9 +84753,15 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
     }
   }
   addLog("[Payload] \u5F00\u59CB\u6E05\u7406\u548C\u9A8C\u8BC1 payload...");
-  preset_data = cleanNovelAIPayload(preset_data, extension_settings62[extensionName].novelaimode);
+  const baseModel = extension_settings62[extensionName].novelaimode;
+  const isMediumEffort = baseModel === "nai-diffusion-5-full" && extension_settings62[extensionName].novelai_v5_effort === "medium";
+  const actualModel = isMediumEffort ? "nai-diffusion-5-full-medium" : baseModel;
+  if (isMediumEffort) {
+    addLog("[NovelAI] \u68C0\u6D4B\u5230\u542F\u7528 V5 Full Medium \u8D28\u91CF/\u7B97\u529B\u6863\u4F4D\uFF0C\u5207\u6362\u4E3A nai-diffusion-5-full-medium\uFF08\u9501\u5B9A 14 \u6B65\uFF09");
+  }
+  preset_data = cleanNovelAIPayload(preset_data, actualModel);
   try {
-    validateNovelAIPayload(preset_data, extension_settings62[extensionName].novelaimode);
+    validateNovelAIPayload(preset_data, actualModel);
   } catch (validationError) {
     addLog(`[\u9A8C\u8BC1\u5931\u8D25] ${validationError.message}`);
     toastr.error(`Payload \u9A8C\u8BC1\u5931\u8D25: ${validationError.message}`, "NovelAI \u751F\u6210\u9519\u8BEF");
@@ -84672,7 +84771,8 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
   }
   const payload = preset_data;
   _nai_gen_params = buildGenParams("NovelAI", {
-    model: extension_settings62[extensionName].novelaimode,
+    model: actualModel,
+    effort: isMediumEffort ? "medium" : "high",
     yushe: _nai_yushe_id,
     yusheRandom: isSettingTrue3(extension_settings62[extensionName].randomYushe),
     promptReplaceId: extension_settings62[extensionName].prompt_replace_id,
@@ -84767,8 +84867,8 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
           console.warn(`Could not parse JSON from /api/secrets/write. Response was: "${responseText}". Continuing without rotating key.`);
         }
       }
-      const tavernAIPayload = { prompt: prompt2, model: extension_settings62[extensionName].novelaimode, sampler: preset_data.sampler, scheduler: preset_data.noise_schedule, steps: preset_data.steps, scale: preset_data.scale, width: preset_data.width, height: preset_data.height, negative_prompt: preset_data.negative_prompt, decrisper: preset_data.dynamic_thresholding, variety_boost: preset_data.skip_cfg_above_sigma, sm: preset_data.sm, sm_dyn: preset_data.sm_dyn, seed: preset_data.seed };
-      if (extension_settings62[extensionName].novelaimode.includes("nai-diffusion-5")) {
+      const tavernAIPayload = { prompt: prompt2, model: actualModel, sampler: preset_data.sampler, scheduler: preset_data.noise_schedule, steps: preset_data.steps, scale: preset_data.scale, width: preset_data.width, height: preset_data.height, negative_prompt: preset_data.negative_prompt, decrisper: preset_data.dynamic_thresholding, variety_boost: preset_data.skip_cfg_above_sigma, sm: preset_data.sm, sm_dyn: preset_data.sm_dyn, seed: preset_data.seed };
+      if (actualModel.includes("nai-diffusion-5")) {
         tavernAIPayload.tag_hint_uc_preset = preset_data.tag_hint_uc_preset;
         tavernAIPayload.tag_hint_qt = preset_data.tag_hint_qt;
         tavernAIPayload.straight_alpha = preset_data.straight_alpha;
@@ -84790,7 +84890,7 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
       }
     } else {
       const Authorization = "Bearer " + access_token;
-      let data11 = { "input": prompt2, "model": extension_settings62[extensionName].novelaimode, "action": "generate", "parameters": payload, "use_new_shared_trial": true };
+      let data11 = { "input": prompt2, "model": actualModel, "action": "generate", "parameters": payload, "use_new_shared_trial": true };
       console.log("data11:", data11);
       const { candidates, rawOtherSite } = getNovelAICandidateUrls("/ai/generate-image");
       const response = await postNovelAIWithFallback({
@@ -84803,7 +84903,17 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
         logPrefix: "[NovelAI]"
       });
       const data123 = await response.arrayBuffer();
-      re = await unzipFile(data123);
+      try {
+        re = await unzipFile(data123);
+      } catch (unzipErr) {
+        if (rawOtherSite) {
+          evictNovelAIUrlCache(rawOtherSite, "/ai/generate-image");
+        }
+        throw unzipErr;
+      }
+      if (rawOtherSite && response._verifiedCandidateUrl) {
+        workingNovelAIUrlCache.set(`${rawOtherSite}|/ai/generate-image`, response._verifiedCandidateUrl);
+      }
     }
     if (!re) {
       throw new Error("\u672A\u80FD\u4ECEAPI\u54CD\u5E94\u4E2D\u63D0\u53D6\u56FE\u50CF\u6570\u636E\u3002");
@@ -84820,6 +84930,10 @@ async function generateNovelAIImage({ prompt: link, width: Xwidth, height: Xheig
     }
     return { image: imageUrl, change: change_ || "", genParams: _nai_gen_params };
   } catch (error) {
+    if (extension_settings62[extensionName].novelaisite !== "\u5B98\u7F51") {
+      const otherSite = normalizeNovelAIOtherSiteUrl(extension_settings62[extensionName].novelaiOtherSite);
+      evictNovelAIUrlCache(otherSite, "/ai/generate-image");
+    }
     isTaskAborted = error.name === "AbortError" || error.message === "\u4EFB\u52A1\u5DF2\u53D6\u6D88" || abortController.signal.aborted || error.message?.includes("\u8D85\u65F6");
     if (isTaskAborted) {
       addLog(`[NovelAI] \u4EFB\u52A1\u5DF2\u88AB\u7528\u6237\u53D6\u6D88\u6216\u8D85\u65F6: ${error.message}`);
@@ -84932,16 +85046,29 @@ async function generateNovelAIInpaint({ prompt: link, width: Xwidth, height: Xhe
     const imgHeight = Number(window.novelaiInpaintHeight) || Number(Xheight) || Number(extension_settings62[extensionName].novelai_height) || 1024;
     addLog(`[NovelAI Inpaint] \u56FE\u50CF\u5C3A\u5BF8: ${imgWidth}x${imgHeight}`);
     const seed = extension_settings62[extensionName].novelai_seed === "0" || extension_settings62[extensionName].novelai_seed === "" || extension_settings62[extensionName].novelai_seed === "-1" ? generateRandomSeed() : Number(extension_settings62[extensionName].novelai_seed);
+    const baseMode = extension_settings62[extensionName].novelaimode || "";
+    let inpaintModel = "nai-diffusion-4-5-curated-inpainting";
+    let inpaintSteps = Number(extension_settings62[extensionName].novelai_steps) || 28;
+    let inpaintSampler = extension_settings62[extensionName].novelai_sampler || "k_euler_ancestral";
+    if (baseMode === "nai-diffusion-5-full") {
+      if (extension_settings62[extensionName].novelai_v5_effort === "medium") {
+        inpaintModel = "nai-diffusion-5-full-medium-inpainting";
+        inpaintSteps = 14;
+        inpaintSampler = "k_euler_ancestral";
+      } else {
+        inpaintModel = "nai-diffusion-5-full-inpainting";
+      }
+    }
     const payload = {
       "action": "infill",
       "input": inpaintPrompt,
-      "model": "nai-diffusion-4-5-curated-inpainting",
+      "model": inpaintModel,
       "parameters": {
         "width": imgWidth,
         "height": imgHeight,
         "scale": Number(extension_settings62[extensionName].nai3Scale) || 5,
-        "sampler": extension_settings62[extensionName].novelai_sampler || "k_euler_ancestral",
-        "steps": Number(extension_settings62[extensionName].novelai_steps) || 28,
+        "sampler": inpaintSampler,
+        "steps": inpaintSteps,
         "seed": seed,
         "n_samples": 1,
         "image": imageBase64,
@@ -85043,7 +85170,18 @@ async function generateNovelAIInpaint({ prompt: link, width: Xwidth, height: Xhe
     });
     addLog("[NovelAI Inpaint] \u6B63\u5728\u89E3\u538B\u8FD4\u56DE\u7684 ZIP \u6587\u4EF6...");
     const arrayBuffer = await response.arrayBuffer();
-    const imageBase64Result = await unzipFile(arrayBuffer);
+    let imageBase64Result;
+    try {
+      imageBase64Result = await unzipFile(arrayBuffer);
+    } catch (unzipErr) {
+      if (rawOtherSite) {
+        evictNovelAIUrlCache(rawOtherSite, "/ai/generate-image");
+      }
+      throw unzipErr;
+    }
+    if (rawOtherSite && response._verifiedCandidateUrl) {
+      workingNovelAIUrlCache.set(`${rawOtherSite}|/ai/generate-image`, response._verifiedCandidateUrl);
+    }
     if (!imageBase64Result) {
       throw new Error("\u672A\u80FD\u4ECEAPI\u54CD\u5E94\u4E2D\u63D0\u53D6\u56FE\u50CF\u6570\u636E");
     }
@@ -85060,6 +85198,10 @@ async function generateNovelAIInpaint({ prompt: link, width: Xwidth, height: Xhe
     addLog(`[NovelAI Inpaint] \u5C40\u90E8\u91CD\u7ED8\u5B8C\u6210 (\u8017\u65F6 ${inpaintDuration} \u79D2)\uFF01`);
     return { image: imageUrl, change: change || "", genParams: _inpaint_gen_params };
   } catch (error) {
+    if (extension_settings62[extensionName].novelaisite !== "\u5B98\u7F51") {
+      const otherSite = normalizeNovelAIOtherSiteUrl(extension_settings62[extensionName].novelaiOtherSite);
+      evictNovelAIUrlCache(otherSite, "/ai/generate-image");
+    }
     isTaskAborted = error.name === "AbortError" || error.message === "\u4EFB\u52A1\u5DF2\u53D6\u6D88" || abortController.signal.aborted || error.message?.includes("\u8D85\u65F6");
     if (isTaskAborted) {
       addLog(`[NovelAI Inpaint] \u8BF7\u6C42\u5DF2\u88AB\u7528\u6237\u53D6\u6D88\u6216\u8D85\u65F6: ${error.message}`);
@@ -87010,12 +87152,12 @@ function renderSummary(stats) {
   if (stats.total.fail > 0) {
     items.push({ val: stats.total.fail, label: "\u5931\u8D25\u6B21\u6570", color: "#ef5350" });
   }
-  let html = '<div style="display:flex; gap:12px; flex-wrap:wrap; padding:8px 12px; background:rgba(255,255,255,0.05); border-radius:6px;">';
+  let html = '<div class="ch-gen-summary-grid">';
   for (const item of items) {
-    html += `<div style="text-align:center; min-width:48px;">`;
-    html += `<div style="font-size:18px; font-weight:bold; color:${item.color};">${item.val}`;
-    if (item.unit) html += `<span style="font-size:11px; margin-left:1px;">${item.unit}</span>`;
-    html += `</div><div style="font-size:10px; opacity:0.55; margin-top:1px;">${item.label}</div></div>`;
+    html += `<div class="ch-stat-card">`;
+    html += `<div class="ch-stat-card-val" style="color:${item.color};">${item.val}`;
+    if (item.unit) html += `<span class="ch-stat-card-unit">${item.unit}</span>`;
+    html += `</div><div class="ch-stat-card-lbl">${item.label}</div></div>`;
   }
   html += "</div>";
   el.innerHTML = html;
@@ -87023,13 +87165,13 @@ function renderSummary(stats) {
 function renderLegend() {
   const el = document.getElementById("ch-gen-legend");
   if (!el) return;
-  let html = '<div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">';
-  html += `<span style="display:flex; align-items:center; gap:4px; font-size:11px; opacity:0.75;">`;
-  html += `<svg width="14" height="8" style="flex-shrink:0;"><line x1="0" y1="4" x2="14" y2="4" stroke="rgba(255,255,255,0.85)" stroke-width="2.4" stroke-linecap="round"/></svg>`;
+  let html = '<div class="ch-gen-legend-container">';
+  html += `<span class="ch-gen-legend-item">`;
+  html += `<svg width="16" height="8" style="flex-shrink:0;"><line x1="0" y1="4" x2="16" y2="4" stroke="rgba(255,255,255,0.85)" stroke-width="2.6" stroke-linecap="round"/></svg>`;
   html += `\u603B\u8BA1</span>`;
   for (const [, meta] of Object.entries(BACKEND_LABELS)) {
-    html += `<span style="display:flex; align-items:center; gap:4px; font-size:11px; opacity:0.75;">`;
-    html += `<svg width="14" height="8" style="flex-shrink:0;"><line x1="0" y1="4" x2="14" y2="4" stroke="${meta.color}" stroke-width="1.6" stroke-linecap="round"/></svg>`;
+    html += `<span class="ch-gen-legend-item">`;
+    html += `<svg width="16" height="8" style="flex-shrink:0;"><line x1="0" y1="4" x2="16" y2="4" stroke="${meta.color}" stroke-width="2" stroke-linecap="round"/></svg>`;
     html += `${meta.icon} ${meta.name}</span>`;
   }
   html += "</div>";
@@ -87046,9 +87188,29 @@ function buildLinePath(values, xOf, yOf) {
   }
   return d;
 }
+var _chartResizeObserver = null;
 function renderChart(period) {
   const el = document.getElementById("ch-gen-chart");
   if (!el) return;
+  if (!_chartResizeObserver && typeof ResizeObserver !== "undefined") {
+    let resizeTimer = null;
+    let lastWidth = el.clientWidth;
+    _chartResizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const currentWidth = entry.contentRect.width;
+        if (currentWidth > 0 && Math.abs(currentWidth - lastWidth) > 15) {
+          lastWidth = currentWidth;
+          clearTimeout(resizeTimer);
+          resizeTimer = setTimeout(() => {
+            renderChart(_currentPeriod);
+          }, 120);
+        }
+      }
+    });
+    if (el.parentElement) {
+      _chartResizeObserver.observe(el.parentElement);
+    }
+  }
   document.querySelectorAll(".ch-period-btn").forEach((btn) => {
     const active = btn.dataset.period === period;
     btn.style.background = active ? "rgba(79,195,247,0.18)" : "transparent";
@@ -87061,26 +87223,40 @@ function renderChart(period) {
   const buckets = aggregateBuckets(stats, period);
   const totals = buckets.map((b) => Object.values(b.data).reduce((s, v) => s + v, 0));
   if (buckets.length === 0 || totals.every((t) => t === 0)) {
-    el.innerHTML = '<div style="text-align:center; opacity:0.5; padding:24px 0; font-size:13px;">\u6682\u65E0\u6570\u636E</div>';
+    el.innerHTML = '<div style="text-align:center; opacity:0.5; padding:28px 0; font-size:13px;">\u6682\u65E0\u6570\u636E</div>';
     return;
   }
   const maxVal = Math.max(...totals, 1);
   const n = buckets.length;
-  const SW = 560, SH = 170;
-  const PL = 36, PR = 10, PT = 12, PB = 30;
+  const containerWidth = el.clientWidth > 50 ? el.clientWidth : window.innerWidth < 768 ? Math.max(300, window.innerWidth - 40) : 560;
+  const isMobile3 = containerWidth <= 520 || window.innerWidth <= 768;
+  const SW = Math.max(300, Math.round(containerWidth));
+  const SH = isMobile3 ? 210 : 180;
+  const PL = isMobile3 ? 36 : 40;
+  const PR = isMobile3 ? 26 : 32;
+  const PT = isMobile3 ? 20 : 16;
+  const PB = isMobile3 ? 32 : 30;
   const pw = SW - PL - PR;
   const ph = SH - PT - PB;
   const xOf = (i) => PL + (n <= 1 ? pw / 2 : i / (n - 1) * pw);
   const yOf = (v) => PT + ph - v / maxVal * ph;
   const baseY = (PT + ph).toFixed(1);
-  const TOTAL_COLOR = "rgba(255,255,255,0.85)";
+  const fSizeY = isMobile3 ? 11 : 10;
+  const fSizeX = isMobile3 ? 11 : 10;
+  const fSizePeak = isMobile3 ? 12 : 11;
+  const fSizeRight = isMobile3 ? 11 : 10;
+  const totalLineWidth = isMobile3 ? 2.8 : 2.4;
+  const backendLineWidth = isMobile3 ? 2 : 1.6;
+  const totalDotR = isMobile3 ? 3.8 : 3;
+  const backendDotR = isMobile3 ? 3 : 2.4;
+  const TOTAL_COLOR = "rgba(255,255,255,0.9)";
   const series = [
-    { key: "total", name: "\u603B\u8BA1", color: TOTAL_COLOR, values: totals, width: 2.4, isTotal: true }
+    { key: "total", name: "\u603B\u8BA1", color: TOTAL_COLOR, values: totals, width: totalLineWidth, isTotal: true }
   ];
   for (const [backend, meta] of Object.entries(BACKEND_LABELS)) {
     const values = buckets.map((b) => b.data[backend] || 0);
     if (values.some((v) => v > 0)) {
-      series.push({ key: backend, name: meta.name, color: meta.color, values, width: 1.6, isTotal: false });
+      series.push({ key: backend, name: meta.name, color: meta.color, values, width: backendLineWidth, isTotal: false });
     }
   }
   const GRID_COUNT = 4;
@@ -87090,36 +87266,37 @@ function renderChart(period) {
     const val = Math.round(maxVal * (1 - g / GRID_COUNT));
     gridSvg += `<line x1="${PL}" y1="${y.toFixed(1)}" x2="${SW - PR}" y2="${y.toFixed(1)}" stroke="currentColor" stroke-opacity="${g === GRID_COUNT ? "0.2" : "0.08"}" stroke-width="1" stroke-dasharray="${g === GRID_COUNT ? "none" : "3,3"}"/>`;
     if (val >= 0) {
-      gridSvg += `<text x="${PL - 4}" y="${(y + 3.5).toFixed(1)}" text-anchor="end" style="fill:currentColor; opacity:0.45;" font-size="9">${val}</text>`;
+      gridSvg += `<text x="${PL - 6}" y="${(y + 4).toFixed(1)}" text-anchor="end" style="fill:currentColor; opacity:0.6;" font-size="${fSizeY}" font-weight="500">${val}</text>`;
     }
   }
-  const showEvery = n > 20 ? Math.ceil(n / 10) : n > 10 ? 2 : 1;
+  const showEvery = isMobile3 ? n > 15 ? Math.ceil(n / 6) : n > 7 ? 2 : 1 : n > 20 ? Math.ceil(n / 10) : n > 10 ? 2 : 1;
   let xLabelsSvg = "";
   for (let i = 0; i < n; i++) {
     if (i % showEvery !== 0 && i !== n - 1) continue;
-    xLabelsSvg += `<text x="${xOf(i).toFixed(1)}" y="${SH - 5}" text-anchor="middle" style="fill:currentColor; opacity:0.45;" font-size="9">${buckets[i].label}</text>`;
+    xLabelsSvg += `<text x="${xOf(i).toFixed(1)}" y="${SH - 6}" text-anchor="middle" style="fill:currentColor; opacity:0.6;" font-size="${fSizeX}">${buckets[i].label}</text>`;
   }
   const totalLinePath = buildLinePath(totals, xOf, yOf);
   const totalAreaPath = `${totalLinePath} L ${xOf(n - 1).toFixed(1)} ${baseY} L ${xOf(0).toFixed(1)} ${baseY} Z`;
   const GRAD_ID = "chGenGrad";
   const gradDef = `<linearGradient id="${GRAD_ID}" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="${TOTAL_COLOR}" stop-opacity="0.18"/>
+      <stop offset="0%" stop-color="${TOTAL_COLOR}" stop-opacity="0.22"/>
       <stop offset="100%" stop-color="${TOTAL_COLOR}" stop-opacity="0.01"/>
     </linearGradient>`;
   const backendSeriesSvg = series.filter((s) => !s.isTotal).map((s) => {
     const lp = buildLinePath(s.values, xOf, yOf);
     if (!lp) return "";
-    return `<path d="${lp}" fill="none" stroke="${s.color}" stroke-width="${s.width}" stroke-linecap="round" stroke-linejoin="round" stroke-opacity="0.85"/>`;
+    return `<path d="${lp}" fill="none" stroke="${s.color}" stroke-width="${s.width}" stroke-linecap="round" stroke-linejoin="round" stroke-opacity="0.9"/>`;
   }).join("\n  ");
   let dotsSvg = "";
-  if (n <= 31) {
+  const maxVisibleDots = isMobile3 ? 20 : 31;
+  if (n <= maxVisibleDots) {
     for (const s of series) {
       for (let i = 0; i < n; i++) {
         const v = s.values[i];
         if (v === 0) continue;
         const tip = `${s.name} | ${buckets[i].bucketKey}: ${v}\u5F20`;
-        const r = s.isTotal ? 3 : 2.5;
-        dotsSvg += `<circle cx="${xOf(i).toFixed(1)}" cy="${yOf(v).toFixed(1)}" r="${r}" fill="${s.color}" stroke="rgba(0,0,0,0.35)" stroke-width="1"><title>${tip}</title></circle>`;
+        const r = s.isTotal ? totalDotR : backendDotR;
+        dotsSvg += `<circle cx="${xOf(i).toFixed(1)}" cy="${yOf(v).toFixed(1)}" r="${r}" fill="${s.color}" stroke="rgba(0,0,0,0.4)" stroke-width="1.2"><title>${tip}</title></circle>`;
       }
     }
   }
@@ -87127,8 +87304,8 @@ function renderChart(period) {
   let peakSvg = "";
   if (totals[maxIdx] > 0) {
     const px = xOf(maxIdx), py = yOf(totals[maxIdx]);
-    const lblX = Math.min(Math.max(px, PL + 14), SW - PR - 14);
-    peakSvg = `<text x="${lblX.toFixed(1)}" y="${(py - 7).toFixed(1)}" text-anchor="middle" fill="${TOTAL_COLOR}" font-size="10" font-weight="bold" opacity="0.9">${totals[maxIdx]}</text>`;
+    const lblX = Math.min(Math.max(px, PL + 16), SW - PR - 16);
+    peakSvg = `<text x="${lblX.toFixed(1)}" y="${(py - 8).toFixed(1)}" text-anchor="middle" fill="${TOTAL_COLOR}" font-size="${fSizePeak}" font-weight="bold" opacity="0.95">${totals[maxIdx]}</text>`;
   }
   let rightLabelsSvg = "";
   const labeledSeries = [...series].reverse();
@@ -87138,17 +87315,17 @@ function renderChart(period) {
     if (lastVal === 0) continue;
     let ly = yOf(lastVal) + 4;
     for (const uy of usedY) {
-      if (Math.abs(ly - uy) < 11) ly = uy + 11;
+      if (Math.abs(ly - uy) < 13) ly = uy + 13;
     }
     usedY.push(ly);
-    rightLabelsSvg += `<text x="${(SW - PR + 3).toFixed(1)}" y="${ly.toFixed(1)}" fill="${s.color}" font-size="9" font-weight="bold" opacity="0.9">${lastVal}</text>`;
+    rightLabelsSvg += `<text x="${(SW - PR + 4).toFixed(1)}" y="${ly.toFixed(1)}" fill="${s.color}" font-size="${fSizeRight}" font-weight="bold" opacity="0.95">${lastVal}</text>`;
   }
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${SW} ${SH}" style="width:100%; height:auto; display:block; overflow:visible;">
   <defs>${gradDef}</defs>
   ${gridSvg}
   <path d="${totalAreaPath}" fill="url(#${GRAD_ID})"/>
   ${backendSeriesSvg}
-  <path d="${totalLinePath}" fill="none" stroke="${TOTAL_COLOR}" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="${totalLinePath}" fill="none" stroke="${TOTAL_COLOR}" stroke-width="${totalLineWidth}" stroke-linecap="round" stroke-linejoin="round"/>
   ${peakSvg}
   ${dotsSvg}
   ${xLabelsSvg}
@@ -87163,22 +87340,24 @@ function renderBackends(stats) {
   for (const [, data] of Object.entries(stats.backends)) {
     if (data.success > maxSuccess) maxSuccess = data.success;
   }
-  let html = '<div style="display:flex; flex-direction:column; gap:5px;">';
+  let html = '<div class="ch-backend-list">';
   for (const [backend, meta] of Object.entries(BACKEND_LABELS)) {
     const data = stats.backends[backend] || { success: 0, fail: 0 };
     if (data.success + data.fail === 0) continue;
     const pct = maxSuccess > 0 ? data.success / maxSuccess * 100 : 0;
-    html += `<div style="display:flex; align-items:center; gap:8px;">`;
-    html += `<span style="width:120px; font-size:12px; white-space:nowrap;">${meta.icon} ${meta.name}</span>`;
-    html += `<div style="flex:1; height:14px; background:rgba(128,128,128,0.15); border-radius:7px; overflow:hidden;">`;
-    html += `<div style="height:100%; width:${pct}%; background:${meta.color}; border-radius:7px; transition:width 0.3s;"></div></div>`;
-    html += `<span style="width:76px; text-align:right; font-size:12px;"><strong>${data.success}</strong>`;
-    if (data.fail > 0) html += ` <span style="color:#ef5350; font-size:11px;">(${data.fail}\u2717)</span>`;
-    html += "</span></div>";
+    html += `<div class="ch-backend-item">`;
+    html += `<div class="ch-backend-header">`;
+    html += `<span class="ch-backend-title">${meta.icon} ${meta.name}</span>`;
+    html += `<span class="ch-backend-value"><strong>${data.success}</strong>`;
+    if (data.fail > 0) html += ` <span style="color:#ef5350; font-size:12px;">(${data.fail}\u2717)</span>`;
+    html += `</span></div>`;
+    html += `<div class="ch-backend-bar-container">`;
+    html += `<div class="ch-backend-bar" style="width:${pct}%; background:${meta.color};"></div></div>`;
+    html += `</div>`;
   }
   for (const [backend, data] of Object.entries(stats.backends)) {
     if (BACKEND_LABELS[backend] || data.success + data.fail === 0) continue;
-    html += `<div style="font-size:12px; opacity:0.6;">\u{1F539} ${backend}: ${data.success} \u6210\u529F / ${data.fail} \u5931\u8D25</div>`;
+    html += `<div style="font-size:13px; opacity:0.75; padding:4px 2px;">\u{1F539} ${backend}: <strong>${data.success}</strong> \u6210\u529F / <span style="color:#ef5350;">${data.fail} \u5931\u8D25</span></div>`;
   }
   html += "</div>";
   el.innerHTML = html;
@@ -90741,6 +90920,7 @@ var OFFICIAL_NOVELAI_MODEL_DEFAULTS = {
     AQT_novelai: "best quality, amazing quality, very aesthetic, absurdres",
     UCP_novelai: "heavy",
     novelai_straight_alpha: false,
+    novelai_v5_effort: "high",
     addFurryDataset: "false",
     AI_use_coords: true,
     sm: false,
@@ -90875,6 +91055,7 @@ var NOVELAI_MODEL_PARAM_KEYS = [
   "AQT_novelai",
   "UCP_novelai",
   "novelai_straight_alpha",
+  "novelai_v5_effort",
   "addFurryDataset",
   "AI_use_coords",
   "sm",
@@ -90952,6 +91133,77 @@ function loadModelConfigIntoUI(modelName) {
       settings3.novelai_size = currentDim;
     }
   }
+  updateNovelaiReferenceSectionsVisibility(modelName);
+  updateNovelaiEffortUIState(modelName);
+}
+function updateNovelaiEffortUIState(targetModel = null) {
+  const novelaiModeSelect = document.getElementById("novelaimode");
+  const selectedModel = targetModel || (novelaiModeSelect ? novelaiModeSelect.value : "");
+  const effortContainer = document.getElementById("novelai_v5_effort_container");
+  const effortInput = document.getElementById("novelai_v5_effort");
+  const stepsInput = document.getElementById("novelai_steps");
+  const samplerSelect = document.getElementById("novelai_sampler");
+  const cfgRescaleInput = document.getElementById("cfg_rescale");
+  const btnHigh = document.getElementById("st_chatu8_effort_high");
+  const btnMedium = document.getElementById("st_chatu8_effort_medium");
+  const isV5Full = selectedModel === "nai-diffusion-5-full";
+  if (effortContainer) {
+    effortContainer.style.display = isV5Full ? "flex" : "none";
+  }
+  if (!isV5Full) {
+    if (stepsInput) {
+      stepsInput.disabled = false;
+      stepsInput.title = "";
+    }
+    if (samplerSelect) {
+      samplerSelect.disabled = false;
+      samplerSelect.title = "";
+    }
+    if (cfgRescaleInput) {
+      cfgRescaleInput.disabled = false;
+      cfgRescaleInput.title = "";
+    }
+    return;
+  }
+  const currentEffort = effortInput ? effortInput.value || "high" : "high";
+  if (btnHigh && btnMedium) {
+    if (currentEffort === "medium") {
+      btnHigh.classList.remove("active");
+      btnMedium.classList.add("active");
+    } else {
+      btnHigh.classList.add("active");
+      btnMedium.classList.remove("active");
+    }
+  }
+  if (currentEffort === "medium") {
+    if (stepsInput) {
+      stepsInput.value = 14;
+      stepsInput.disabled = true;
+      stepsInput.title = "Medium \u6863\u4F4D\u5DF2\u9501\u5B9A\u4E3A 14 \u6B65\uFF08\u84B8\u998F\u9AD8\u6548\u6A21\u578B\uFF09";
+    }
+    if (samplerSelect) {
+      samplerSelect.value = "k_euler_ancestral";
+      samplerSelect.disabled = true;
+      samplerSelect.title = "Medium \u6863\u4F4D\u5DF2\u9501\u5B9A\u4F7F\u7528 Euler Ancestral \u91C7\u6837\u5668";
+    }
+    if (cfgRescaleInput) {
+      cfgRescaleInput.disabled = true;
+      cfgRescaleInput.title = "Medium \u6863\u4F4D\u4E0D\u652F\u6301 Prompt Guidance Rescale";
+    }
+  } else {
+    if (stepsInput) {
+      stepsInput.disabled = false;
+      stepsInput.title = "";
+    }
+    if (samplerSelect) {
+      samplerSelect.disabled = false;
+      samplerSelect.title = "";
+    }
+    if (cfgRescaleInput) {
+      cfgRescaleInput.disabled = false;
+      cfgRescaleInput.title = "";
+    }
+  }
 }
 function resetCurrentModelToOfficialDefault() {
   const novelaiModeSelect = document.getElementById("novelaimode");
@@ -90992,13 +91244,14 @@ function updateNai3OptionsVisibility() {
     straightAlphaContainer.style.display = isNai5 ? "flex" : "none";
   }
 }
-function updateNovelaiReferenceSectionsVisibility() {
+function updateNovelaiReferenceSectionsVisibility(targetModel = null) {
+  const settings3 = extension_settings75[extensionName] || {};
   const novelaiModeSelect = document.getElementById("novelaimode");
   const vibeSection = document.getElementById("nai-vibe-transfer-section");
   const charRefSection = document.getElementById("nai-char-ref-section");
   const vibeGroupSection = document.getElementById("nai-vibe-group-section");
-  if (!novelaiModeSelect) return;
-  const selectedModel = novelaiModeSelect.value;
+  const selectedModel = targetModel || (novelaiModeSelect ? novelaiModeSelect.value : null) || settings3.novelaimode;
+  if (!selectedModel) return;
   if (vibeSection) {
     vibeSection.style.display = selectedModel === "nai-diffusion-3" ? "block" : "none";
   }
@@ -91071,8 +91324,10 @@ function updateNovelaiModelSchedule(isInitial = false) {
   const novelaiModeSelect = document.getElementById("novelaimode");
   const scheduleSelect = document.getElementById("Schedule");
   const samplerSelect = document.getElementById("novelai_sampler");
-  if (!novelaiModeSelect || !scheduleSelect || !samplerSelect) return;
+  if (!novelaiModeSelect) return;
   const selectedModel = novelaiModeSelect.value;
+  updateNovelaiReferenceSectionsVisibility(selectedModel);
+  if (!scheduleSelect || !samplerSelect) return;
   if (!isInitial && lastSelectedNovelaiModel && lastSelectedNovelaiModel !== selectedModel) {
     saveModelConfigFromUI(lastSelectedNovelaiModel);
   }
@@ -91080,9 +91335,8 @@ function updateNovelaiModelSchedule(isInitial = false) {
   lastSelectedNovelaiModel = selectedModel;
   updateNai3OptionsVisibility();
   updateNovelaiUcpOptions();
-  updateNovelaiReferenceSectionsVisibility();
   const isV5 = selectedModel.includes("nai-diffusion-5");
-  const straightAlphaField = document.getElementById("st-chatu8-novelai-straight-alpha-field");
+  const straightAlphaField = document.getElementById("novelai_straight_alpha_container");
   if (straightAlphaField) {
     straightAlphaField.style.display = isV5 ? "flex" : "none";
   }
@@ -91219,9 +91473,25 @@ function initNovelaiUI(settingsModal) {
       icon.removeClass("fa-eye-slash").addClass("fa-eye");
     }
   });
+  settingsModal.find(".st-chatu8-effort-btn").on("click", function() {
+    const effort = $(this).data("effort");
+    const effortInput = document.getElementById("novelai_v5_effort");
+    if (effortInput) {
+      effortInput.value = effort;
+      $(effortInput).trigger("change");
+    }
+    updateNovelaiEffortUIState();
+    const modeSelect = document.getElementById("novelaimode");
+    const currentModel = modeSelect ? modeSelect.value : null;
+    if (currentModel) {
+      saveModelConfigFromUI(currentModel);
+      saveSettingsDebounced47();
+    }
+  });
   updateNovelaiScheduleVisibility();
   updateNovelaiModelSchedule(true);
   updateNovelaiOtherSiteVisibility();
+  updateNovelaiEffortUIState();
 }
 
 // utils/settings/vibeTransferGenerator.js
@@ -99460,6 +99730,7 @@ init_ui_common();
 // utils/settings/video_assets_merger.js
 init_videoAssetsService();
 init_configDatabase();
+init_ui_common();
 var canvasWidth = 1024;
 var canvasHeight = 1024;
 var canvasBg = "transparent";
@@ -99473,6 +99744,7 @@ var isSpacePressed = false;
 var panStartPointer = { x: 0, y: 0 };
 var panStartOffset = { x: 0, y: 0 };
 var isInitialized2 = false;
+var mergerResizeHandler = null;
 var mergerMode = "create";
 var currentEditingAsset = null;
 var currentDragMode = null;
@@ -99518,6 +99790,36 @@ function clearAllLayers() {
     renderLayers();
   }
 }
+function applyMergerMobileLayout() {
+  if (!$mergerModal || !$mergerModal.length || !$mergerModal.is(":visible")) return;
+  const $container4 = $mergerModal.find(".va-merger-container");
+  if (window.innerWidth <= 768) {
+    const { topBound, availableHeight } = getMobileLayoutBounds(document);
+    $mergerModal.css({ "align-items": "start" });
+    $container4.css({
+      "margin-top": `${topBound}px`,
+      "height": `${availableHeight}px`
+    });
+  } else {
+    $mergerModal.css({ "align-items": "" });
+    $container4.css({
+      "margin-top": "",
+      "height": ""
+    });
+  }
+}
+function ensureMergerResizeListener() {
+  if (!mergerResizeHandler) {
+    mergerResizeHandler = () => {
+      if ($mergerModal && $mergerModal.is(":visible")) {
+        applyMergerMobileLayout();
+        fitCanvasToViewport();
+      }
+    };
+    window.addEventListener("resize", mergerResizeHandler, { passive: true });
+    window.addEventListener("orientationchange", mergerResizeHandler, { passive: true });
+  }
+}
 function openMergerForCreate() {
   if (!isInitialized2) {
     initMergerStudio();
@@ -99530,11 +99832,15 @@ function openMergerForCreate() {
   $("#va-merger-btn-overwrite-asset").hide();
   $("#va-merger-btn-save-as-new").hide();
   $mergerModal.css("display", "flex").hide().fadeIn(150, () => {
+    applyMergerMobileLayout();
     fitCanvasToViewport();
   });
+  applyMergerMobileLayout();
   requestAnimationFrame(() => {
+    applyMergerMobileLayout();
     fitCanvasToViewport();
   });
+  ensureMergerResizeListener();
   renderLayers();
 }
 function openMergerForAsset(asset, dataUrl) {
@@ -99549,15 +99855,29 @@ function openMergerForAsset(asset, dataUrl) {
   $("#va-merger-btn-overwrite-asset").show();
   $("#va-merger-btn-save-as-new").show();
   $mergerModal.css("display", "flex").hide().fadeIn(150, () => {
+    applyMergerMobileLayout();
     fitCanvasToViewport();
   });
+  applyMergerMobileLayout();
   requestAnimationFrame(() => {
+    applyMergerMobileLayout();
     fitCanvasToViewport();
   });
+  ensureMergerResizeListener();
   addImageLayer(dataUrl, asset.name || "\u8D44\u4EA7\u7D20\u6750", asset.fileid, { autoFitCanvas: true, fullCover: true });
 }
 function closeMergerStudio() {
   $mergerModal.fadeOut(150);
+  $mergerModal.css({ "align-items": "" });
+  $mergerModal.find(".va-merger-container").css({
+    "margin-top": "",
+    "height": ""
+  });
+  if (mergerResizeHandler) {
+    window.removeEventListener("resize", mergerResizeHandler);
+    window.removeEventListener("orientationchange", mergerResizeHandler);
+    mergerResizeHandler = null;
+  }
 }
 function initMergerStudio() {
   $mergerModal = $("#va-merger-modal");
@@ -100824,6 +101144,7 @@ function normalizeFps(rawFps) {
 }
 
 // utils/settings/video_frame_extractor.js
+init_ui_common();
 var isInitialized3 = false;
 var currentVideoFile = null;
 var currentVideoObjectUrl = null;
@@ -100835,6 +101156,7 @@ var totalFrames = 0;
 var isPlaying = false;
 var currentCapturedDataUrl = null;
 var currentCapturedBlob = null;
+var extractorResizeHandler = null;
 var $modal;
 var $video;
 var videoEl;
@@ -100875,6 +101197,24 @@ var $btnSaveAsset;
 var $btnDownload;
 var $btnCopy;
 var $btnToMerger;
+function applyExtractorMobileLayout() {
+  if (!$modal || !$modal.length || !$modal.is(":visible")) return;
+  const $container4 = $modal.find(".va-extractor-container");
+  if (window.innerWidth <= 768) {
+    const { topBound, availableHeight } = getMobileLayoutBounds(document);
+    $modal.css({ "align-items": "start" });
+    $container4.css({
+      "margin-top": `${topBound}px`,
+      "height": `${availableHeight}px`
+    });
+  } else {
+    $modal.css({ "align-items": "" });
+    $container4.css({
+      "margin-top": "",
+      "height": ""
+    });
+  }
+}
 function initVideoFrameExtractor() {
   $modal = $("#va-extractor-modal");
   if ($modal.length === 0) return;
@@ -100929,7 +101269,19 @@ function openVideoFrameExtractor() {
   if (!isInitialized3) {
     initVideoFrameExtractor();
   }
-  $modal.css("display", "flex").hide().fadeIn(150);
+  $modal.css("display", "flex").hide().fadeIn(150, () => {
+    applyExtractorMobileLayout();
+  });
+  applyExtractorMobileLayout();
+  if (!extractorResizeHandler) {
+    extractorResizeHandler = () => {
+      if ($modal && $modal.is(":visible")) {
+        applyExtractorMobileLayout();
+      }
+    };
+    window.addEventListener("resize", extractorResizeHandler, { passive: true });
+    window.addEventListener("orientationchange", extractorResizeHandler, { passive: true });
+  }
 }
 function closeVideoFrameExtractor() {
   if (videoEl) {
@@ -100938,6 +101290,16 @@ function closeVideoFrameExtractor() {
   isPlaying = false;
   updatePlayButtonUI();
   $modal.fadeOut(150);
+  $modal.css({ "align-items": "" });
+  $modal.find(".va-extractor-container").css({
+    "margin-top": "",
+    "height": ""
+  });
+  if (extractorResizeHandler) {
+    window.removeEventListener("resize", extractorResizeHandler);
+    window.removeEventListener("orientationchange", extractorResizeHandler);
+    extractorResizeHandler = null;
+  }
 }
 function bindUploadEvents() {
   $closeBtn.off("click").on("click", closeVideoFrameExtractor);
@@ -101055,6 +101417,10 @@ function bindVideoPlaybackEvents() {
     updatePlayButtonUI();
   });
   $btnPlay.off("click").on("click", togglePlayPause);
+  $video.off("click").on("click", (e) => {
+    e.stopPropagation();
+    togglePlayPause();
+  });
 }
 var isSliderDragging = false;
 function bindFrameControlEvents() {
@@ -108414,6 +108780,7 @@ var NOVELAI_PROFILE_KEYS = [
   "showQueueGreeting",
   "cloudQueueTimeout",
   "novelaimode",
+  "novelai_v5_effort",
   "novelai_straight_alpha",
   "novelai_sampler",
   "Schedule",
@@ -109860,6 +110227,7 @@ image### 1girl, solo, blue hair ###
   cloudQueueUrl: "\u4E91\u7AEF\u961F\u5217\u670D\u52A1\u5730\u5740\uFF08\u81EA\u90E8\u7F72\u6216\u793E\u533A\u516C\u5171\u8282\u70B9\uFF09",
   cloudQueueGreeting: "\u4E91\u961F\u5217\u9996\u6B21\u8FDE\u63A5\u65F6\u7684\u95EE\u5019\u8BED\uFF08\u793E\u533A\u793C\u4EEA\uFF09",
   showQueueGreeting: "\u5728\u961F\u5217\u7B49\u5F85\u65F6\u662F\u5426\u663E\u793A\u95EE\u5019\u8BED\u63D0\u793A",
+  novelai_v5_effort: "NovelAI V5 Full \u7684\u8D28\u91CF\u4E0E\u7B97\u529B\u6863\u4F4D\uFF1AHigh \u4E3A\u9AD8\u8D28\u91CF 23 \u6B65\u539F\u7248\uFF1BMedium \u4E3A\u7701\u6D41 14 \u6B65\u84B8\u998F\u7248\uFF08\u7701\u7EA6 42% \u7B97\u529B\u4E14\u753B\u8D28\u76F8\u8FD1\uFF0C\u9501\u5B9A 14 \u6B65\u4E0E Euler Ancestral\uFF09",
   novelai_sampler: "NovelAI \u91C7\u6837\u5668\uFF08Euler / Euler Ancestral / DPM++ \u7B49\uFF09",
   Schedule: "\u91C7\u6837\u8C03\u5EA6\u8868\uFF08Native / Karras / Exponential \u7B49\uFF09",
   nai3Scale: "Prompt Guidance\uFF1A\u63D0\u793A\u8BCD\u5F15\u5BFC\u5F3A\u5EA6\uFF0C\u5E38\u7528 `5~10`",
@@ -110505,12 +110873,13 @@ eventSource45.on(event_types6.GENERATION_ENDED, async (data) => {
       try {
         console.log("[st-chatu8] Triggering handlePromptRequest with gesture1 for messageId:", messageId);
         debugMilestone("autoLLMClick.GENERATION_ENDED", "\u5F00\u59CB\u89E6\u53D1 handlePromptRequest");
-        debugLog("autoLLMClick.GENERATION_ENDED", "\u8C03\u7528 handlePromptRequest", {
+        debugLog("autoLLMClick.GENERATION_ENDED", "\u8C03\u7528 handlePromptRequest (\u81EA\u52A8\u89E6\u53D1\u6A21\u5F0F)", {
           gestureId: "gesture1",
           messageId,
-          elementConnected: el.isConnected
+          elementConnected: el.isConnected,
+          source: "auto"
         });
-        handlePromptRequest(el, "gesture1");
+        handlePromptRequest(el, "gesture1", { source: "auto", isAuto: true, skipDemandPopup: true });
       } catch (error) {
         console.error("[st-chatu8] handlePromptRequest failed:", error);
         debugLog("autoLLMClick.GENERATION_ENDED", "handlePromptRequest \u8C03\u7528\u5931\u8D25", {
@@ -110879,7 +111248,7 @@ async function initUI({ check_update: check_update2 }) {
       settings2.theme_id = "\u9ED8\u8BA4-\u767D\u5929";
     }
     applyTheme(settings2.themes[settings2.theme_id]);
-    const mainKeys = ["scriptEnabled", "helpTipsEnabled", "disablePluginToast", "newlineFixEnabled", "mode", "client", "displayMode", "heavyFrontendMode", "insertOriginalText", "dbclike", "collapseImage", "zidongdianji", "zidongdianji2", "longPressToEdit", "clickToPreview", "startTag", "endTag", "cache", "sdUrl", "st_chatu8_sd_auth", "comfyuiUrl", "comfyui_token", "comfyui_max_concurrency", "comfyui_timeout", "novelaiApi", "novelaisite", "novelaiOtherSite", "enableCloudQueue", "cloudQueueUrl", "cloudQueueGreeting", "showQueueGreeting", "novelaimode", "novelai_sampler", "Schedule", "nai3Scale", "cfg_rescale", "AI_use_coords", "sm", "dyn", "nai3Variety", "nai3Deceisp", "sd_cwidth", "sd_cheight", "sd_csteps", "sd_cseed", "sdCfgScale", "restoreFaces", "novelai_width", "novelai_height", "novelai_steps", "novelai_seed", "nai3VibeTransfer", "enableVibeGroupTransfer", "randomVibeGroup", "normalizeRefStrength", "InformationExtracted", "ReferenceStrength", "nai3CharRef", "nai3StylePerception", "comfyui_width", "comfyui_height", "comfyui_steps", "comfyui_seed", "cfg_comfyui", "worker", "ipa", "c_fenwei", "c_xijie", "c_quanzhong", "c_idquanzhong", "AQT_sd", "UCP_sd", "AQT_novelai", "UCP_novelai", "AQT_comfyui", "UCP_comfyui", "addFurryDataset", "sd_cupscale_factor", "sd_chires_fix", "sd_chires_steps", "sd_cdenoising_strength", "sd_cclip_skip", "sd_cadetailer", "worldBookEnabled", "ai_temperature", "ai_top_p", "ai_presence_penalty", "ai_frequency_penalty", "ai_stream", "ai_private", "ai_token", "vocabulary_search_startswith", "vocabulary_search_limit", "vocabulary_search_sort", "enablePregen", "autoLLMImageGen", "randomYushe", "aiAutonomousResolution", "videoChannel", "imageAlignment", "imageSizeScale", "imageGenInterval", "translation_system_prompt", "ai_test_system", "ai_test_user", "ai_test_output", "jiuguanchucun", "vibeJiuguanchucun", "convertToJpegStorage", "weilin_lora_fix"];
+    const mainKeys = ["scriptEnabled", "helpTipsEnabled", "disablePluginToast", "newlineFixEnabled", "mode", "client", "displayMode", "heavyFrontendMode", "insertOriginalText", "dbclike", "collapseImage", "zidongdianji", "zidongdianji2", "longPressToEdit", "clickToPreview", "startTag", "endTag", "cache", "sdUrl", "st_chatu8_sd_auth", "comfyuiUrl", "comfyui_token", "comfyui_max_concurrency", "comfyui_timeout", "novelaiApi", "novelaisite", "novelaiOtherSite", "enableCloudQueue", "cloudQueueUrl", "cloudQueueGreeting", "showQueueGreeting", "novelaimode", "novelai_v5_effort", "novelai_sampler", "Schedule",
     mainKeys.forEach((key) => {
       const element = document.getElementById(key);
       if (element) {
@@ -111276,6 +111645,7 @@ async function initUI({ check_update: check_update2 }) {
       }
     }
     updateNovelaiOtherSiteVisibility();
+    updateNovelaiReferenceSectionsVisibility(settings2.novelaimode);
   }
   loadSettingsIntoUI();
   updateGenerationModeHandlers();
@@ -111368,6 +111738,9 @@ async function initUI({ check_update: check_update2 }) {
         updateLogView();
         updateErrorStats();
         updateImageGenStats();
+      } else if (tabId === "novelai") {
+        updateNovelaiReferenceSectionsVisibility();
+        updateNovelaiOtherSiteVisibility();
       } else if (tabId === "character") {
         refreshCharacterSettings(targetTab);
       } else if (tabId === "video_assets") {
@@ -111715,15 +112088,6 @@ async function initUI({ check_update: check_update2 }) {
         saveSettingsDebounced71();
         await handleInsertOriginalTextRegex(true);
         changes.push('\u5DF2\u5F00\u542F"\u63D2\u5165\u539F\u6587(\u975E\u540C\u5C42)"');
-      }
-      if (extension_settings113[extensionName]?.imageGenDemandEnabled) {
-        extension_settings113[extensionName].imageGenDemandEnabled = false;
-        const imageGenDemandSwitch = $("#ch-image-gen-demand-enabled");
-        if (imageGenDemandSwitch.length) {
-          imageGenDemandSwitch.prop("checked", false);
-        }
-        saveSettingsDebounced71();
-        changes.push('\u5DF2\u5173\u95ED"\u751F\u56FE\u9700\u6C42\u5F39\u7A97"');
       }
       if (changes.length > 0) {
         toastr.info(changes.join("\uFF0C"), "\u81EA\u52A8LLM\u8BF7\u6C42\u751F\u56FE\u5DF2\u542F\u7528");
